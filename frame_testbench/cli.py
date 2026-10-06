@@ -1,0 +1,143 @@
+"""Agent-friendly CLI. Input overrides persist until explicitly released."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from . import install, pose, transport
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Bench:
+    def __init__(self, socket_path=None):
+        self.socket = socket_path or os.environ.get('FRAME_TESTBENCH_SOCKET',
+            f'/run/user/{os.getuid()}/frame-testbench.sock')
+
+    def control(self, command):
+        return transport.request(self.socket, command)
+
+    def native(self, *arguments):
+        binary = os.environ.get('FRAME_TESTBENCH_OBSERVER', str(ROOT / 'build/frame-observe'))
+        return transport.run_json([binary, *map(str, arguments)])
+
+    def capture(self, output):
+        if output:
+            directory = Path(output).resolve()
+            directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        else:
+            parent = ROOT / 'artifacts'
+            parent.mkdir(mode=0o700, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix='capture-', dir=parent))
+        result = self.native('capture', str(directory))
+        result['output'] = str(directory)
+        result['files'] = {name: str(directory / name) for name in ('preview.png', 'stereo.png')
+                           if (directory / name).is_file()}
+        (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+        return result
+
+
+def parser():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--host', help='SSH host alias; commands execute on the headset')
+    ap.add_argument('--remote-root', default='dev/frame-testbench', help='remote checkout, relative to SSH home or absolute')
+    ap.add_argument('--socket', help='override local input control socket')
+    commands = ap.add_subparsers(dest='command', required=True)
+    commands.add_parser('status', help='runtime poses, frames and input override readback')
+    worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
+    worn.add_argument('state', choices=('on', 'off', 'physical'))
+    p = commands.add_parser('pose', help='override the actual HMD pose')
+    poses = p.add_subparsers(dest='pose_command', required=True)
+    absolute = poses.add_parser('set')
+    absolute.add_argument('--position', type=float, nargs=3, required=True, metavar=('X', 'Y', 'Z'))
+    absolute.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
+    absolute.add_argument('--space', choices=('standing', 'raw'), default='standing')
+    relative = poses.add_parser('move')
+    relative.add_argument('--translation', type=float, nargs=3, default=[0, 0, 0], metavar=('X', 'Y', 'Z'))
+    relative.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
+    relative.add_argument('--space', choices=('standing', 'raw'), default='standing')
+    poses.add_parser('reset', help='restore physical pose while retaining worn override')
+    commands.add_parser('release', help='restore physical pose and proximity')
+    capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
+    capture.add_argument('--output', help='new output directory, on headset when using --host')
+    for name in ('install', 'uninstall'):
+        p = commands.add_parser(name, help='change only the SteamVR user service override')
+        p.add_argument('--restart', action='store_true', help='restart SteamVR now; interrupts VR')
+    return ap
+
+
+def dispatch(args, bench):
+    if args.command == 'status':
+        runtime = bench.native('status')
+        try:
+            state = bench.control('status')
+            state['available'] = True
+        except (OSError, RuntimeError) as error:
+            state = {'available': False, 'error': str(error)}
+        return {'ok': True, 'runtime': runtime, 'input': state}
+    if args.command == 'worn':
+        return bench.control({'on': 'worn 1', 'off': 'worn 0', 'physical': 'worn-release'}[args.state])
+    if args.command == 'release':
+        return bench.control('release')
+    if args.command == 'pose':
+        if args.pose_command == 'reset':
+            return bench.control('pose-release')
+        if args.pose_command == 'set':
+            desired = pose.from_euler(args.position, args.rotation)
+        else:
+            pose.from_euler(args.translation, args.rotation)  # validate before I/O
+            state = bench.control('status')
+            if not state['pose_override']:
+                raise ValueError('pose move requires pose set first')
+            desired = state['pose']
+        transform = None
+        if args.space == 'standing':
+            transform = pose.from_matrix(bench.native('status')['raw_to_standing'])
+            if args.pose_command == 'move':
+                desired = pose.compose(transform, desired)
+        if args.pose_command == 'move':
+            desired = pose.offset(desired, args.translation, args.rotation)
+        if transform:
+            desired = pose.compose(pose.inverse(transform), desired)
+        values = desired['position'] + desired['quaternion']
+        return bench.control('pose ' + ' '.join(format(v, '.17g') for v in values))
+    if args.command == 'capture':
+        return bench.capture(args.output)
+    if args.command in ('install', 'uninstall'):
+        result = install.stage(ROOT / 'build', Path.home()) if args.command == 'install' else install.remove(Path.home())
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True, timeout=20)
+        if args.restart:
+            subprocess.run(['systemctl', '--user', 'restart', 'steamvr.service'], check=True, timeout=90)
+            result['restart_requested'] = True
+        return result
+    raise ValueError('unsupported command')
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = parser().parse_args(arguments)
+    try:
+        if args.host:
+            # Remove only the transport options; preserve arguments and literal values.
+            forwarded = []
+            i = 0
+            while i < len(arguments):
+                item = arguments[i]
+                if item in ('--host', '--remote-root'):
+                    i += 2
+                    continue
+                if item.startswith(('--host=', '--remote-root=')):
+                    i += 1
+                    continue
+                forwarded.append(item)
+                i += 1
+            result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=110)
+        else:
+            result = dispatch(args, Bench(args.socket))
+        print(json.dumps(result, indent=2, allow_nan=False))
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(json.dumps({'ok': False, 'error': str(error)}))
+        return 1

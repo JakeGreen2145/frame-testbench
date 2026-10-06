@@ -47,6 +47,15 @@ class PoseTests(unittest.TestCase):
         for a, b in zip(p.to_matrix(restored), matrix):
             self.assertAlmostEqual(a, b, places=6)
 
+    def test_reference_space_conversion(self):
+        p = self.module()
+        raw_to_standing = p.from_euler([0, 1.6, 0], [30, 0, 0])
+        desired = p.from_euler([.3, 1.7, -.2], [90, -20, 0])
+        raw = p.compose(p.inverse(raw_to_standing), desired)
+        actual = p.compose(raw_to_standing, raw)
+        for a, b in zip(p.to_matrix(actual), p.to_matrix(desired)):
+            self.assertAlmostEqual(a, b, places=7)
+
     def test_invalid_values(self):
         p = self.module()
         for pos, rot in [([0, 0], [0, 0, 0]), ([0, float('nan'), 0], [0, 0, 0]),

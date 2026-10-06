@@ -49,6 +49,18 @@ def offset(pose, translation, angles):
             'quaternion': normalize(multiply(delta['quaternion'], normalize(pose['quaternion'])))}
 
 
+def compose(parent, child):
+    rotated = rotate(parent['quaternion'], child['position'])
+    return {'position': [a+b for a, b in zip(vector(parent['position'], 3), rotated)],
+            'quaternion': normalize(multiply(normalize(parent['quaternion']), normalize(child['quaternion'])))}
+
+
+def inverse(pose):
+    w, x, y, z = normalize(pose['quaternion'])
+    q = [w, -x, -y, -z]
+    return {'position': rotate(q, [-v for v in vector(pose['position'], 3)]), 'quaternion': q}
+
+
 def to_matrix(pose):
     w, x, y, z = normalize(pose['quaternion'])
     px, py, pz = vector(pose['position'], 3)
