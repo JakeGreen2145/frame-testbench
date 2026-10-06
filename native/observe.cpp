@@ -180,6 +180,155 @@ std::string status(Sdk &sdk) {
     return out.str();
 }
 
+void input_check(vr::EVRInputError error, const char *operation) {
+    if (error != vr::VRInputError_None)
+        throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(error));
+}
+
+std::string input_origin(vr::IVRInput *input, vr::IVRSystem *system, vr::VRInputValueHandle_t handle) {
+    vr::InputOriginInfo_t info{};
+    info.trackedDeviceIndex = vr::k_unTrackedDeviceIndexInvalid;
+    const auto error = input->GetOriginTrackedDeviceInfo(handle, &info, sizeof(info));
+    const bool valid = error == vr::VRInputError_None && info.trackedDeviceIndex < vr::k_unMaxTrackedDeviceCount;
+    vr::ETrackedPropertyError serial_error = vr::TrackedProp_InvalidDevice;
+    std::string serial;
+    if (valid) {
+        std::array<char, vr::k_unMaxPropertyStringSize> buffer{};
+        const auto count = system->GetStringTrackedDeviceProperty(info.trackedDeviceIndex,
+            vr::Prop_SerialNumber_String, buffer.data(), buffer.size(), &serial_error);
+        if (serial_error == vr::TrackedProp_Success) {
+            if (!count || count > buffer.size() || buffer[count - 1] != '\0') serial_error = vr::TrackedProp_BufferTooSmall;
+            else serial.assign(buffer.data(), count - 1);
+        }
+    }
+    std::ostringstream out;
+    out << "{\"handle\":" << quote(std::to_string(handle)) << ",\"error\":" << error
+        << ",\"device_path_handle\":" << (valid ? quote(std::to_string(info.devicePath)) : "null")
+        << ",\"device_index\":" << (valid ? std::to_string(info.trackedDeviceIndex) : "null")
+        << ",\"serial\":" << (serial_error == vr::TrackedProp_Success ? quote(serial) : "null")
+        << ",\"serial_error\":" << (valid ? std::to_string(serial_error) : "null")
+        << ",\"synthetic\":" << boolean(serial == "frame_testbench_left" || serial == "frame_testbench_right") << '}';
+    return out.str();
+}
+
+struct ObservedAction {
+    std::string side, component, action, type;
+    int axis = 0;
+    bool reserved = false;
+    vr::VRActionHandle_t handle = vr::k_ulInvalidActionHandle;
+    vr::VRInputValueHandle_t device = vr::k_ulInvalidInputValueHandle;
+    vr::EVRInputError handle_error = vr::VRInputError_None;
+};
+
+std::string inputs(Sdk &sdk, const fs::path &manifest, unsigned wait_ms) {
+    auto *input = sdk.get<vr::IVRInput>(vr::IVRInput_Version);
+    auto *system = sdk.get<vr::IVRSystem>(vr::IVRSystem_Version);
+    input_check(input->SetActionManifestPath(manifest.c_str()), "SetActionManifestPath");
+    vr::VRActiveActionSet_t set{};
+    input_check(input->GetActionSetHandle("/actions/observe", &set.ulActionSet), "GetActionSetHandle");
+    if (set.ulActionSet == vr::k_ulInvalidActionSetHandle)
+        throw std::runtime_error("GetActionSetHandle returned invalid handle");
+    std::vector<ObservedAction> actions;
+    for (const std::string side : {"left", "right"}) {
+        vr::VRInputValueHandle_t device = vr::k_ulInvalidInputValueHandle;
+        auto source_error = input->GetInputSourceHandle(("/user/hand/" + side).c_str(), &device);
+        if (source_error == vr::VRInputError_None && device == vr::k_ulInvalidInputValueHandle)
+            source_error = vr::VRInputError_InvalidHandle;
+        auto add = [&](const std::string &part, const std::string &component, const std::string &type, int axis = 0) {
+            ObservedAction a;
+            a.side = side;
+            a.component = "/input/" + part + '/' + component;
+            a.action = "/actions/observe/in/" + side + '_' + part + '_' + (type == "vector2" ? "position" : component);
+            a.type = type;
+            a.axis = axis;
+            a.reserved = part == "system" || part == "thumbrest";
+            a.device = device;
+            a.handle_error = source_error;
+            if (a.handle_error == vr::VRInputError_None) {
+                a.handle_error = input->GetActionHandle(a.action.c_str(), &a.handle);
+                if (a.handle_error == vr::VRInputError_None && a.handle == vr::k_ulInvalidActionHandle)
+                    a.handle_error = vr::VRInputError_InvalidHandle;
+            }
+            actions.push_back(a);
+        };
+        std::vector<std::string> buttons = {"system", "bumper", "trigger", "grip", "thumbstick"};
+        const std::vector<std::string> extra = side == "left"
+            ? std::vector<std::string>{"view", "dpad_up", "dpad_right", "dpad_down", "dpad_left"}
+            : std::vector<std::string>{"menu", "a", "b", "x", "y"};
+        buttons.insert(buttons.end(), extra.begin(), extra.end());
+        for (const auto &part : buttons) {
+            add(part, "click", "boolean");
+            add(part, "touch", "boolean");
+        }
+        add("thumbrest", "touch", "boolean");
+        for (const auto &part : {"trigger", "grip"}) add(part, "value", "vector1");
+        add("thumbstick", "x", "vector2");
+        add("thumbstick", "y", "vector2", 1);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(wait_ms);
+    unsigned updates = 0;
+    for (;;) {
+        const auto update_error = input->UpdateActionState(&set, sizeof(set), 1);
+        ++updates;
+        if (update_error != vr::VRInputError_None && update_error != vr::VRInputError_NoData)
+            input_check(update_error, "UpdateActionState");
+        bool ready = update_error == vr::VRInputError_None;
+        std::ostringstream snapshot;
+        snapshot << '{';
+        if (update_error == vr::VRInputError_None) {
+            for (const std::string side : {"left", "right"}) {
+                if (side == "right") snapshot << ',';
+                snapshot << quote(side) << ":{";
+                bool first = true;
+                for (const auto &a : actions) {
+                    if (a.side != side) continue;
+                    if (!first) snapshot << ',';
+                    first = false;
+                    auto error = a.handle_error;
+                    vr::InputDigitalActionData_t digital{};
+                    vr::InputAnalogActionData_t analog{};
+                    const bool is_digital = a.type == "boolean";
+                    if (error == vr::VRInputError_None) {
+                        error = is_digital ? input->GetDigitalActionData(a.handle, &digital, sizeof(digital), a.device)
+                            : input->GetAnalogActionData(a.handle, &analog, sizeof(analog), a.device);
+                    }
+                    const bool success = error == vr::VRInputError_None;
+                    const bool active = success && (is_digital ? digital.bActive : analog.bActive);
+                    if (!a.reserved && !active) ready = false;
+                    snapshot << quote(a.component) << ":{\"action\":" << quote(a.action)
+                        << ",\"type\":" << quote(a.type) << ",\"error\":" << error
+                        << ",\"active\":" << (success ? boolean(active) : "null") << ",\"value\":";
+                    if (!active) snapshot << "null";
+                    else if (is_digital) snapshot << boolean(digital.bState);
+                    else number(snapshot, a.axis == 1 ? analog.y : analog.x);
+                    snapshot << ",\"origin\":";
+                    if (active) snapshot << input_origin(input, system, is_digital ? digital.activeOrigin : analog.activeOrigin);
+                    else snapshot << "null";
+                    snapshot << '}';
+                }
+                snapshot << '}';
+            }
+        }
+        snapshot << '}';
+        const auto now = std::chrono::steady_clock::now();
+        if (ready || now >= deadline) {
+            input_check(update_error, "UpdateActionState");
+            std::ostringstream out;
+            out << "{\"ok\":true,\"command\":\"inputs\",\"manifest\":" << quote(manifest.string())
+                << ",\"action_set\":\"/actions/observe\",\"binding_ready\":" << boolean(ready)
+                << ",\"wait_expired\":" << boolean(!ready) << ",\"updates\":" << updates
+                << ",\"wait_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count()
+                << ",\"inputs\":" << snapshot.str() << '}';
+            return out.str();
+        }
+        // A fresh process may see inactive bindings while SteamVR loads the manifest.
+        // Never wait forever for reserved system or SteamVR-internal thumbrest inputs.
+        std::this_thread::sleep_for(std::min(std::chrono::milliseconds(50),
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+    }
+}
+
 std::string set_pause(Sdk &sdk, bool requested) {
     auto *settings = sdk.get<vr::IVRSettings>(vr::IVRSettings_Version);
     vr::EVRSettingsError error = vr::VRSettingsError_None;
@@ -303,14 +452,21 @@ int main(int argc, char **argv) {
     output_fd = dup(STDOUT_FILENO);
     if (output_fd < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) return 1;
     try {
-        const std::string usage = "usage: frame-observe status | capture ABS_OUTPUT_DIR | setting true|false|1|0 | debug DEVICE_INDEX REQUEST";
+        const std::string usage = "usage: frame-observe status | inputs ABS_MANIFEST_PATH | capture ABS_OUTPUT_DIR | setting true|false|1|0 | debug DEVICE_INDEX REQUEST";
         if (argc < 2) throw std::runtime_error(usage);
         const std::string command = argv[1];
         fs::path directory;
         bool requested = false;
         unsigned device = 0;
+        unsigned input_wait_ms = 2000;
         if (command == "status" && argc == 2) {}
-        else if (command == "capture" && argc == 3) {
+        else if (command == "inputs" && argc == 3) {
+            directory = fs::path(argv[2]);
+            if (!directory.is_absolute()) throw std::runtime_error("input manifest must be absolute");
+            if (!fs::is_regular_file(directory)) throw std::runtime_error("input manifest must be an existing regular file");
+            if (const char *value = std::getenv("FRAME_OBSERVE_INPUT_WAIT_MS"))
+                input_wait_ms = integer(value, 0, 10000);
+        } else if (command == "capture" && argc == 3) {
             directory = fs::path(argv[2]);
             if (!directory.is_absolute()) throw std::runtime_error("capture output must be absolute");
             std::error_code error;
@@ -336,6 +492,7 @@ int main(int argc, char **argv) {
         {
             Sdk sdk;
             if (command == "status") result = status(sdk);
+            else if (command == "inputs") result = inputs(sdk, directory, input_wait_ms);
             else if (command == "setting") result = set_pause(sdk, requested);
             else if (command == "capture") result = capture(sdk, directory);
             else result = debug(sdk, device, argv[3]);

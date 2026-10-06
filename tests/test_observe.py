@@ -17,6 +17,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def input_components(side):
+    buttons = ['system', 'bumper', 'trigger', 'grip', 'thumbstick']
+    buttons += ['view', 'dpad_up', 'dpad_right', 'dpad_down', 'dpad_left'] if side == 'left' else ['menu', 'a', 'b', 'x', 'y']
+    result = {f'/input/{button}/{kind}': 'boolean' for button in buttons for kind in ('click', 'touch')}
+    result['/input/thumbrest/touch'] = 'boolean'
+    result.update({f'/input/{part}/value': 'vector1' for part in ('trigger', 'grip')})
+    result.update({f'/input/thumbstick/{axis}': 'vector2' for axis in ('x', 'y')})
+    return result
+
+
+def action_name(side, component):
+    suffix = component.removeprefix('/input/').replace('/', '_')
+    if suffix in ('thumbstick_x', 'thumbstick_y'):
+        suffix = 'thumbstick_position'
+    return f'/actions/observe/in/{side}_{suffix}'
+
+
 def png():
     def chunk(kind, data):
         return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
@@ -29,6 +46,47 @@ def fake_source():
     # Derive actual vtable signatures, never guessed ABI layouts. Every method
     # outside the explicit read/capture/settings/debug contract aborts.
     overrides = {
+        'SetActionManifestPath': '''if(!pchActionManifestPath || pchActionManifestPath[0]!='/') abort();
+            log("manifest"); manifest_set=true;
+            return mode("manifest_error")?VRInputError_InvalidParam:VRInputError_None;''',
+        'GetActionSetHandle': '''if(!manifest_set || std::string(pchActionSetName)!="/actions/observe") abort();
+            *pHandle=90; return mode("set_error")?VRInputError_NameNotFound:VRInputError_None;''',
+        'GetActionHandle': '''if(!manifest_set) abort();
+            std::string name(pchActionName); if(name.find("/actions/observe/in/")!=0) abort();
+            if(mode("missing_action") && name=="/actions/observe/in/left_bumper_click") return VRInputError_NameNotFound;
+            for(size_t i=0;i<action_names.size();++i) if(action_names[i]==name){*pHandle=i+1;return VRInputError_None;}
+            action_names.push_back(name); *pHandle=action_names.size(); return VRInputError_None;''',
+        'GetInputSourceHandle': '''std::string name(pchInputSourcePath);
+            if(name!="/user/hand/left" && name!="/user/hand/right") abort();
+            *pHandle=name=="/user/hand/left"?104:107;
+            return mode("source_error") && *pHandle==107?VRInputError_NameNotFound:VRInputError_None;''',
+        'UpdateActionState': '''if(!manifest_set || unSetCount!=1 || unSizeOfVRSelectedActionSet_t!=sizeof(*pSets) ||
+                pSets[0].ulActionSet!=90 || pSets[0].ulRestrictedToDevice!=k_ulInvalidInputValueHandle ||
+                pSets[0].ulSecondaryActionSet || pSets[0].nPriority) abort();
+            ++updates; log("update_actions");
+            if(mode("input_hang")) for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+            if(mode("update_error")) return VRInputError_InvalidParam;
+            if(mode("no_data") || (mode("delayed_update") && updates<3)) return VRInputError_NoData;
+            return VRInputError_None;''',
+        'GetDigitalActionData': '''if(unActionDataSize!=sizeof(*pActionData)) abort();
+            const auto &name=check_action(action,ulRestrictToDevice);
+            if(name.find("_value")!=std::string::npos || name.find("_position")!=std::string::npos) abort();
+            *pActionData={}; pActionData->bActive=input_active(name);
+            pActionData->bState=ulRestrictToDevice==104; pActionData->bChanged=true;
+            pActionData->activeOrigin=ulRestrictToDevice+1000;
+            return mode("digital_error") && name=="/actions/observe/in/left_bumper_click"?VRInputError_WrongType:VRInputError_None;''',
+        'GetAnalogActionData': '''if(unActionDataSize!=sizeof(*pActionData)) abort();
+            const auto &name=check_action(action,ulRestrictToDevice);
+            if(name.find("_value")==std::string::npos && name.find("_position")==std::string::npos) abort();
+            *pActionData={}; pActionData->bActive=input_active(name);
+            pActionData->activeOrigin=ulRestrictToDevice+1000;
+            pActionData->x=ulRestrictToDevice==104?.25f:.75f; pActionData->y=ulRestrictToDevice==104?-.5f:.5f;
+            if(mode("nonfinite")) pActionData->x=std::numeric_limits<float>::quiet_NaN();
+            return mode("analog_error") && name=="/actions/observe/in/right_trigger_value"?VRInputError_WrongType:VRInputError_None;''',
+        'GetOriginTrackedDeviceInfo': '''if(unOriginInfoSize!=sizeof(*pOriginInfo) || (origin!=1104 && origin!=1107)) abort();
+            if(mode("origin_error")) return VRInputError_InvalidHandle;
+            *pOriginInfo={}; pOriginInfo->devicePath=origin-1000; pOriginInfo->trackedDeviceIndex=origin==1104?4:7;
+            strcpy(pOriginInfo->rchRenderModelComponentName,"input"); return VRInputError_None;''',
         'GetDeviceToAbsoluteTrackingPose': '''if(fPredictedSecondsToPhotonsFromNow != 0 ||
                 (unTrackedDevicePoseArrayCount != 1 && unTrackedDevicePoseArrayCount != k_unMaxTrackedDeviceCount)) abort();
             log(("poses " + std::to_string(eOrigin) + " " + std::to_string(unTrackedDevicePoseArrayCount)).c_str());
@@ -110,16 +168,31 @@ def fake_source():
 #include <chrono>
 #include <vector>
 #include <cstdio>
+#include <limits>
 using namespace vr;
 bool setting=true;
+bool manifest_set=false;
+unsigned updates=0;
+std::vector<std::string> action_names;
 std::thread worker;
 bool mode(const char *m){const char *v=getenv("FAKE_MODE");return v && std::string(v)==m;}
 void log(const char *s){const char *p=getenv("FAKE_LOG");if(p) std::ofstream(p,std::ios::app)<<s<<"\\n";}
+const std::string &check_action(VRActionHandle_t action,VRInputValueHandle_t device){
+ if(!updates || !action || action>action_names.size()) abort();
+ const auto &name=action_names[action-1];
+ if(device!=(name.find("/left_")!=std::string::npos?104:107)) abort();
+ return name;
+}
+bool input_active(const std::string &name){
+ if(mode("inactive") || name.find("thumbrest")!=std::string::npos || name.find("system")!=std::string::npos) return false;
+ if(mode("delayed") && updates<4 && name.find("/right_")!=std::string::npos) return false;
+ return true;
+}
 void check_setting(const char *s,const char *k){if(std::string(s)!="power" || std::string(k)!="pauseCompositorOnStandby") abort();}
 HmdMatrix34_t matrix(float x){HmdMatrix34_t m={};for(int i=0;i<3;i++)m.m[i][i]=1;m.m[0][3]=x;return m;}
 '''
     source += 'std::vector<unsigned char> image={' + ','.join(str(b) for b in png()) + '};\n'
-    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug'):
+    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput'):
         match = re.search(r'class\s+' + interface + r'\s*\{(.*?)\n\s*\};', header, re.DOTALL)
         assert match is not None, interface
         body = match.group(1)
@@ -143,7 +216,7 @@ bool VR_IsInterfaceVersionValid(const char *v){log(v);return !mode("bad_version"
 void *VR_GetGenericInterface(const char *v,EVRInitError *e){*e=VRInitError_None;
  if(mode("missing_interface")){*e=VRInitError_Init_InterfaceNotFound;return nullptr;}
 '''
-    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug'):
+    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput'):
         source += f'if(std::string(v)=={interface}_Version) return &object{interface};\n'
     return source + '*e=VRInitError_Init_InterfaceNotFound;return nullptr;}\n}\n'
 
@@ -172,7 +245,7 @@ class ObserveTests(unittest.TestCase):
         self.path = Path(self.case.name)
         self.log = self.path / 'calls.log'
         self.env = dict(os.environ, OPENVR_API_LIBRARY=str(self.library), FAKE_LOG=str(self.log),
-                        FAKE_MODE='', FRAME_OBSERVE_TIMEOUT_SECONDS='3')
+                        FAKE_MODE='', FRAME_OBSERVE_TIMEOUT_SECONDS='3', FRAME_OBSERVE_INPUT_WAIT_MS='200')
 
     def tearDown(self):
         self.case.cleanup()
@@ -190,6 +263,140 @@ class ObserveTests(unittest.TestCase):
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def inputs(self, **kwargs):
+        return self.run_observe('inputs', ROOT / 'resources/input-actions.json', **kwargs)
+
+    def test_inputs_read_all_components_with_handed_values_and_origin_identity(self):
+        data = self.inputs()
+        self.assertEqual(data['command'], 'inputs')
+        self.assertEqual(data['manifest'], str(ROOT / 'resources/input-actions.json'))
+        self.assertEqual(data['action_set'], '/actions/observe')
+        self.assertTrue(data['binding_ready'])
+        self.assertFalse(data['wait_expired'])
+        for side, scalar, y, digital, index in [('left', .25, -.5, True, 4), ('right', .75, .5, False, 7)]:
+            entries = data['inputs'][side]
+            self.assertEqual(set(entries), set(input_components(side)))
+            for component, kind in input_components(side).items():
+                entry = entries[component]
+                self.assertEqual(entry['action'], action_name(side, component))
+                self.assertEqual(entry['type'], kind)
+                self.assertEqual(entry['error'], 0)
+                if '/system/' in component or '/thumbrest/' in component:
+                    self.assertFalse(entry['active'])
+                    self.assertIsNone(entry['value'])
+                    self.assertIsNone(entry['origin'])
+                    continue
+                self.assertTrue(entry['active'])
+                self.assertEqual(entry['value'], digital if kind == 'boolean' else y if component.endswith('/y') else scalar)
+                self.assertEqual(entry['origin']['device_index'], index)
+                self.assertEqual(entry['origin']['serial'], 'frame_testbench_' + side)
+                self.assertTrue(entry['origin']['synthetic'])
+                self.assertEqual(entry['origin']['error'], 0)
+                self.assertEqual(entry['origin']['serial_error'], 0)
+        calls = self.calls()
+        self.assertLess(calls.index('manifest'), calls.index('update_actions'))
+        self.assertEqual(calls[-1], 'shutdown')
+
+    def test_inputs_wait_for_both_sides_and_transient_update_no_data(self):
+        for mode, minimum in [('delayed', 4), ('delayed_update', 3)]:
+            self.log.unlink(missing_ok=True)
+            data = self.inputs(mode=mode)
+            self.assertTrue(data['binding_ready'])
+            self.assertGreaterEqual(self.calls().count('update_actions'), minimum)
+            self.assertTrue(data['inputs']['right']['/input/trigger/value']['active'])
+
+    def test_inputs_inactive_is_not_zero_or_false_and_wait_is_bounded(self):
+        start = time.monotonic()
+        data = self.inputs(mode='inactive')
+        self.assertGreaterEqual(time.monotonic() - start, .18)
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertFalse(data['binding_ready'])
+        self.assertTrue(data['wait_expired'])
+        for entries in data['inputs'].values():
+            for entry in entries.values():
+                self.assertFalse(entry['active'])
+                self.assertIsNone(entry['value'])
+                self.assertIsNone(entry['origin'])
+                self.assertEqual(entry['error'], 0)
+
+    def test_inputs_component_errors_preserve_other_readback(self):
+        for mode, side, component in [('missing_action', 'left', '/input/bumper/click'),
+                                      ('digital_error', 'left', '/input/bumper/click'),
+                                      ('analog_error', 'right', '/input/trigger/value'),
+                                      ('source_error', 'right', '/input/bumper/click')]:
+            with self.subTest(mode=mode):
+                data = self.inputs(mode=mode)
+                entry = data['inputs'][side][component]
+                self.assertNotEqual(entry['error'], 0)
+                self.assertIsNone(entry['active'])
+                self.assertIsNone(entry['value'])
+                self.assertIsNone(entry['origin'])
+                self.assertTrue(data['inputs']['left']['/input/grip/value']['active'])
+                self.assertFalse(data['binding_ready'])
+
+    def test_inputs_origin_errors_do_not_invent_identity(self):
+        data = self.inputs(mode='origin_error')
+        origin = data['inputs']['left']['/input/trigger/value']['origin']
+        self.assertNotEqual(origin['error'], 0)
+        self.assertIsNone(origin['device_index'])
+        self.assertIsNone(origin['serial'])
+        self.assertFalse(origin['synthetic'])
+        data = self.inputs(mode='controller_property_error')
+        origin = data['inputs']['right']['/input/trigger/value']['origin']
+        self.assertEqual(origin['device_index'], 7)
+        self.assertIsNone(origin['serial'])
+        self.assertNotEqual(origin['serial_error'], 0)
+        self.assertFalse(origin['synthetic'])
+
+    def test_inputs_setup_and_update_errors_fail_with_json(self):
+        for mode, operation in [('manifest_error', 'SetActionManifestPath'), ('set_error', 'GetActionSetHandle'),
+                                ('update_error', 'UpdateActionState'), ('no_data', 'UpdateActionState')]:
+            data = self.inputs(ok=False, mode=mode)
+            self.assertIn(operation, data['error'])
+
+    def test_inputs_nonfinite_analog_is_json_null(self):
+        data = self.inputs(mode='nonfinite')
+        self.assertIsNone(data['inputs']['left']['/input/trigger/value']['value'])
+
+    def test_inputs_hung_sdk_and_readiness_obey_process_alarm(self):
+        self.env['FRAME_OBSERVE_TIMEOUT_SECONDS'] = '1'
+        self.env['FRAME_OBSERVE_INPUT_WAIT_MS'] = '5000'
+        for mode in ('input_hang', 'inactive'):
+            self.assertIn('timed out', self.inputs(ok=False, mode=mode)['error'])
+
+    def test_inputs_cli_validation_happens_before_sdk(self):
+        for args in [('inputs',), ('inputs', 'relative.json'), ('inputs', self.path / 'missing.json'),
+                     ('inputs', self.path), ('inputs', self.path, 'extra')]:
+            self.run_observe(*args, ok=False)
+        for value in ('-1', '10001', '2x'):
+            self.env['FRAME_OBSERVE_INPUT_WAIT_MS'] = value
+            self.inputs(ok=False)
+        self.assertEqual(self.calls(), [])
+
+    def test_original_input_resources_cover_each_frame_component(self):
+        manifest_path = ROOT / 'resources/input-actions.json'
+        self.assertTrue(manifest_path.is_file(), 'original action manifest missing')
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest['action_sets'], [{'name': '/actions/observe', 'usage': 'leftright'}])
+        self.assertEqual(manifest['default_bindings'], [{'controller_type': 'frame_controller', 'binding_url': 'frame-controller-bindings.json'}])
+        expected = {action_name(side, path): kind for side in ('left', 'right') for path, kind in input_components(side).items()}
+        actions = {a['name']: a['type'] for a in manifest['actions']}
+        self.assertEqual(actions, expected)
+        self.assertEqual(len(manifest['actions']), len(expected))
+        self.assertTrue(all(a['requirement'] == 'optional' for a in manifest['actions']))
+        binding = json.loads((manifest_path.parent / 'frame-controller-bindings.json').read_text())
+        self.assertEqual(binding['controller_type'], 'frame_controller')
+        actual = {}
+        for source in binding['bindings']['/actions/observe']['sources']:
+            side, part = source['path'].split('/')[3], source['path'].split('/')[-1]
+            self.assertEqual(source['mode'], 'trigger' if part in ('trigger', 'grip') else 'joystick' if part == 'thumbstick' else 'button')
+            for slot, target in source['inputs'].items():
+                component = f'/input/{part}/' + ('value' if slot == 'pull' else 'x' if slot == 'position' else slot)
+                self.assertEqual(target['output'], action_name(side, component))
+                self.assertNotIn(target['output'], actual)
+                actual[target['output']] = actions[target['output']]
+        self.assertEqual(actual, expected)
 
     def test_bad_cli_is_rejected_before_sdk(self):
         for args in [(), ('wat',), ('status', 'extra'), ('capture',), ('capture', 'relative'),
