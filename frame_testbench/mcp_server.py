@@ -159,7 +159,7 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def controller_pose_reset(side: Side) -> CallToolResult:
-        """Restore physical tracking for one controller, leaving other overrides unchanged."""
+        """Disconnect one synthetic controller, leaving HMD and other controller overrides unchanged."""
         return await execute(['controller', side, 'reset'])
 
     @server.tool()

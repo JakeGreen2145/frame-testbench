@@ -1,4 +1,6 @@
-# Validation
+# Initial HMD validation
+
+This records the original HMD-only version. See [controller and MCP validation](controller-mcp-validation.md) for the later extension.
 
 ## Live Steam Frame, 2026-10-06
 

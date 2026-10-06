@@ -1,11 +1,12 @@
 # Frame Testbench
 
-Headset input and compositor observation tools for closed-loop development on Steam Frame. A Python CLI drives native OpenVR adapters locally or over SSH. Commands return JSON. No MCP server, controller emulation, or replacement compositor.
+Headset and controller pose tools for closed-loop development on Steam Frame. A Python CLI and stdio MCP server drive native OpenVR adapters locally or over SSH. CLI commands return JSON; MCP captures also return image content for agent vision. This is not a replacement compositor.
 
 ## What it controls
 
 - The real HMD's worn/unworn proximity input.
 - The real HMD's translation and rotation, including valid synthetic tracking while physical tracking is unavailable.
+- Independent left/right synthetic controller translation and rotation, without requiring powered physical controllers.
 - SteamVR stereo screenshots, with runtime pose/frame metadata and optional downloads to the agent machine.
 
 Input overrides stay active across CLI calls. `release` restores physical input. There is no per-screenshot activation/rollback cycle. Do not wear the headset while another person or agent is driving its pose.
@@ -60,12 +61,34 @@ Installation copies the native libraries to a content-addressed directory under 
 
 Coordinates are right-handed: +X right, +Y up, forward -Z. Positive yaw turns left, positive pitch looks up, positive roll rotates around +Z. Euler composition is Y * X * Z. Relative moves use the chosen world's axes, not head-local axes. `--space raw` is available on `pose set` and `pose move`; the default Standing space uses the runtime's actual raw-to-standing transform, not an assumed floor offset. A relative move requires an active absolute pose first.
 
+## Controller poses
+
+```sh
+./frame-testbench controller left set --position -.25 1.2 -.5 --rotation 0 0 0
+./frame-testbench controller right set --position .25 1.2 -.5 --rotation 0 0 0
+./frame-testbench controller left move --translation .1 0 -.1 --rotation 30 0 0
+./frame-testbench status
+./frame-testbench capture --output artifacts/controllers
+./frame-testbench controller left reset
+./frame-testbench release
+```
+
+Controller coordinates and rotations use the same conventions as the HMD, including `--space raw`. Setting a pose connects that synthetic controller; resetting disconnects it. Global `release` disconnects both synthetic controllers and releases HMD pose/proximity overrides. HMD `pose reset` and `worn physical` remain selective.
+
+These are additional pose-only devices with stable serials `frame_testbench_left` and `frame_testbench_right`, not overrides of your physical controllers. Physical controller inputs pass through unchanged. Keep physical controllers off during synthetic left/right tests to avoid competing role assignments. Check the exact synthetic device indices and downstream poses in `status`; an application's action bindings may impose additional requirements. Buttons, triggers, sticks, skeletal input, and haptics are not simulated.
+
+## MCP server
+
+The optional stdio server exposes the same operations as typed MCP tools. It returns capture metadata and a PNG image block, so an agent can inspect the result without a separate file-reading tool. It opens no network listener. Host selection is fixed at startup, not controlled by tool arguments.
+
+See [MCP setup and tools](docs/mcp.md) for installation and client configuration. Installation/restarts remain explicit CLI operations rather than agent-exposed MCP tools.
+
 ## Remote agent use
 
 Sync the repository without builds, captures, or `.git`, then compile on Frame:
 
 ```sh
-rsync -az --exclude=.git --exclude=build --exclude=artifacts ./ frame:dev/frame-testbench/
+rsync -az --exclude=.git --exclude=build --exclude=artifacts --exclude=.venv --exclude=__pycache__ ./ frame:dev/frame-testbench/
 ssh frame 'cd dev/frame-testbench && make'
 ./frame-testbench --host frame install --restart
 ./frame-testbench --host frame compositor awake
@@ -109,6 +132,6 @@ This leaves the stock runtime and its driver files untouched. The proxy starts w
 
 ## Verification
 
-`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. These tests do not substitute for the live headset checks documented in `docs/validation.md`.
+`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md) and [controller/MCP validation](docs/controller-mcp-validation.md).
 
 OpenVR headers retain Valve's license under `vendor/`. The remaining project code is MIT licensed.

@@ -113,8 +113,9 @@ Examples of tool arguments:
 ```
 
 Input overrides persist until explicitly reset or released. Disconnecting the
-MCP client does not release them. `release_all` restores physical HMD/controller
-tracking and proximity, but leaves the compositor policy unchanged. Use
+MCP client does not release them. `release_all` restores physical HMD tracking
+and proximity and disconnects the synthetic controllers, but leaves the compositor
+policy unchanged. Physical controller tracking is never overridden. Use
 `compositor` with `{"mode":"auto"}` separately to restore automatic standby.
 Do not apply virtual tracking overrides while someone relies on normal tracking.
 
