@@ -97,6 +97,7 @@ def fake_source():
                 p.mDeviceToAbsoluteTracking=matrix(float(eOrigin) + 100*float(i));
                 p.vVelocity.v[0]=0.25f+float(i); p.vAngularVelocity.v[2]=float(i);
             }''',
+        'IsInputAvailable': 'return !mode("input_unavailable");',
         'GetTrackedDeviceClass': '''if(unDeviceIndex>=k_unMaxTrackedDeviceCount) abort();
             if(unDeviceIndex==0) return TrackedDeviceClass_HMD;
             if(mode("no_controllers")) return TrackedDeviceClass_Invalid;
@@ -266,6 +267,10 @@ class ObserveTests(unittest.TestCase):
 
     def inputs(self, **kwargs):
         return self.run_observe('inputs', ROOT / 'resources/input-actions.json', **kwargs)
+
+    def test_inputs_reports_application_input_availability(self):
+        self.assertIs(self.inputs()['input_available'], True)
+        self.assertIs(self.inputs(mode='input_unavailable')['input_available'], False)
 
     def test_inputs_read_all_components_with_handed_values_and_origin_identity(self):
         data = self.inputs()

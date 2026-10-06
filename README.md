@@ -75,7 +75,9 @@ Coordinates are right-handed: +X right, +Y up, forward -Z. Positive yaw turns le
 
 Controller coordinates and rotations use the same conventions as the HMD, including `--space raw`. Setting a pose connects that synthetic controller; resetting disconnects it. Global `release` disconnects both synthetic controllers and releases HMD pose/proximity overrides. HMD `pose reset` and `worn physical` remain selective.
 
-These are additional pose-only devices with stable serials `frame_testbench_left` and `frame_testbench_right`, not overrides of your physical controllers. Physical controller inputs pass through unchanged. Keep physical controllers off during synthetic left/right tests to avoid competing role assignments. Check the exact synthetic device indices and downstream poses in `status`; an application's action bindings may impose additional requirements. Buttons, triggers, sticks, skeletal input, and haptics are not simulated.
+These are additional devices with stable serials `frame_testbench_left` and `frame_testbench_right`, not overrides of your physical controllers. Physical controller inputs pass through unchanged. Keep physical controllers off during synthetic left/right tests to avoid competing role assignments. Check the exact synthetic device indices and downstream poses in `status`.
+
+The controllers expose the Frame profile's buttons, trigger/grip values, thumbstick axes, and click/touch components. See [controller input commands and layout](docs/controller-inputs.md). `inputs` provides separate action-based runtime readback; application bindings can transform or reserve inputs. Skeletal input and haptics are not simulated.
 
 ## MCP server
 
@@ -132,6 +134,6 @@ This leaves the stock runtime and its driver files untouched. The proxy starts w
 
 ## Verification
 
-`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md) and [controller/MCP validation](docs/controller-mcp-validation.md).
+`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md), [controller/MCP validation](docs/controller-mcp-validation.md), and [button/analog/touch validation](docs/input-validation.md).
 
 OpenVR headers retain Valve's license under `vendor/`. The remaining project code is MIT licensed.

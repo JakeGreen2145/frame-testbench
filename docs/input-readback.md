@@ -32,6 +32,7 @@ One JSON object on stdout. SDK chatter goes to stderr. A successful snapshot has
 | `command` | `"inputs"` |
 | `manifest` | Supplied absolute manifest path |
 | `action_set` | `"/actions/observe"` |
+| `input_available` | Public `IVRSystem::IsInputAvailable()` result; false when dashboard or another runtime state suppresses application input |
 | `binding_ready` | Every non-system/non-thumbrest entry on both hands is active with no action error |
 | `wait_expired` | Readiness deadline elapsed without satisfying that condition |
 | `updates` | Number of `UpdateActionState` calls |
@@ -73,6 +74,8 @@ Fresh observer processes can initially see inactive actions while SteamVR loads 
 - `FRAME_OBSERVE_TIMEOUT_SECONDS`: existing whole-process limit, default `20`, allowed `1` through `120`. It bounds initialization, SDK calls, binding wait, and shutdown, including hung calls.
 
 An absent controller, partial binding or lost application focus can leave `binding_ready` false. The final snapshot still reports what SteamVR returned. `binding_ready` is a convenience condition, not proof that reserved inputs are accessible or that device identity matches the expected serial.
+
+On the tested Frame, the open Steam dashboard suppressed every application action. Check `input_available` before diagnosing binding failure. With a connected synthetic controller, a deliberate `controller right button system on` followed by `controller right button system off` toggles the dashboard. Do not blindly toggle it on every read: that can close or open real UI. Once the dashboard was closed, 24 components per hand were active with the expected synthetic origins, including thumbrest and system touch. System click itself remained reserved. The observer reports this limitation; it does not seize focus or echo proxy values.
 
 ## Verification
 

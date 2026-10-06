@@ -316,6 +316,7 @@ std::string inputs(Sdk &sdk, const fs::path &manifest, unsigned wait_ms) {
             input_check(update_error, "UpdateActionState");
             std::ostringstream out;
             out << "{\"ok\":true,\"command\":\"inputs\",\"manifest\":" << quote(manifest.string())
+                << ",\"input_available\":" << boolean(system->IsInputAvailable())
                 << ",\"action_set\":\"/actions/observe\",\"binding_ready\":" << boolean(ready)
                 << ",\"wait_expired\":" << boolean(!ready) << ",\"updates\":" << updates
                 << ",\"wait_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count()
