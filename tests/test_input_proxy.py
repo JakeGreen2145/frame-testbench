@@ -75,6 +75,202 @@ class InputProxyTests(unittest.TestCase):
         self.assertTrue(r["controller_identity"])
         self.assertTrue(r["factory_identity"])
 
+    def test_synthetic_controller_registration_and_disconnected_defaults(self):
+        s = self.rpc("status")
+        self.assertIn("controllers", s)
+        r = self.runtime("controllers")["controllers"]
+        for k, hand in enumerate(("left", "right")):
+            self.assertEqual(s["controllers"][hand], {"device_index": 20 + k, "pose_override": False, "pose": None, "synthetic": True})
+            self.assertTrue(r[k]["registered"])
+            self.assertGreater(r[k]["count"], 0)
+            self.assertTrue(r[k]["raw"])
+            self.assertFalse(r[k]["connected"])
+            self.assertFalse(r[k]["valid"])
+            self.assertFalse(r[k]["sample_connected"])
+            self.assertFalse(r[k]["sample_valid"])
+            self.assertEqual(r[k]["sample_qw"], 1)
+            self.assertEqual(r[k]["role"], k + 1)
+            self.assertEqual(r[k]["serial"], "frame_testbench_" + hand)
+            self.assertTrue(r[k]["render_model"])
+        self.assertTrue(self.runtime("controller-methods")["ok"])
+        self.assertTrue(self.runtime("forward")["controller_identity"])
+
+    def test_controller_translation_rotation_and_ticks_without_hmd(self):
+        for hand, xyz, q in [("left", [1, 2, 3], [0, 2, 0, 0]), ("right", [-4, 5, -6], [0, 0, 0, 3])]:
+            s = self.rpc("controller-pose " + hand + " " + " ".join(map(str, xyz + q)))
+            self.assertTrue(s["ok"], s)
+            c = s["controllers"][hand]
+            self.assertTrue(c["pose_override"])
+            self.assertEqual(c["pose"]["position"], xyz)
+            self.assertEqual(c["pose"]["quaternion"], [int(v != 0) for v in q])
+            self.assertTrue(c["pose"]["valid"])
+            self.assertTrue(c["pose"]["connected"])
+        self.runtime("physical")
+        before = self.runtime("controllers")["controllers"]
+        # HMD state must not gate controller publication, including an inactive HMD.
+        self.runtime("deactivate")
+        time.sleep(0.08)
+        after = self.runtime("controllers")["controllers"]
+        for k, xyz, q in [(0, [1, 2, 3], [0, 1, 0, 0]), (1, [-4, 5, -6], [0, 0, 0, 1])]:
+            self.assertGreater(after[k]["count"], before[k]["count"] + 2)
+            self.assertEqual(after[k]["position"], xyz)
+            self.assertEqual(after[k]["quaternion"], q)
+            self.assertEqual(after[k]["sample_x"], xyz[0])
+            for field in ("raw", "running", "valid", "connected", "sample_connected", "sample_valid"):
+                self.assertTrue(after[k][field], field)
+        self.assertEqual(self.runtime("metrics")["other_x"], 99)
+        self.assertFalse(self.runtime("metrics")["other_worn"])
+        s = self.rpc("status")
+        self.assertFalse(s["pose_override"])
+        self.assertIsNone(s["worn_override"])
+        self.assertIsNone(s["hmd_index"])
+        self.assertTrue(self.rpc("controller-pose left 7 8 9 1e308 -1e308 0 0")["ok"])
+        q = self.rpc("status")["controllers"]["left"]["pose"]["quaternion"]
+        self.assertAlmostEqual(sum(v*v for v in q), 1)
+        self.assertAlmostEqual(q[0], -q[1])
+        self.assertEqual(self.rpc("status")["controllers"]["right"]["pose"]["position"], [-4, 5, -6])
+
+    def test_controller_release_is_selective_and_disconnects(self):
+        for cmd in ("pose 10 20 30 1 0 0 0", "worn 1",
+                    "controller-pose left 1 2 3 1 0 0 0", "controller-pose right 4 5 6 1 0 0 0"):
+            self.assertTrue(self.rpc(cmd)["ok"])
+        s = self.rpc("controller-release left")
+        self.assertTrue(s["ok"], s)
+        self.assertTrue(s["pose_override"])
+        self.assertTrue(s["worn_override"])
+        self.assertEqual(s["controllers"]["left"], {"device_index": 20, "pose_override": False, "pose": None, "synthetic": True})
+        self.assertTrue(s["controllers"]["right"]["pose_override"])
+        before = self.runtime("controllers")["controllers"]
+        self.assertFalse(before[0]["connected"])
+        self.assertFalse(before[0]["valid"])
+        self.assertTrue(before[0]["raw"])
+        self.assertEqual(before[0]["quaternion"], [1, 0, 0, 0])
+        time.sleep(0.05)
+        after = self.runtime("controllers")["controllers"]
+        self.assertEqual(after[0]["count"], before[0]["count"])
+        self.assertGreater(after[1]["count"], before[1]["count"])
+        for cmd in ("pose-release", "worn-release"):
+            self.assertTrue(self.rpc(cmd)["controllers"]["right"]["pose_override"])
+        self.assertTrue(self.rpc("controller-release all")["ok"])
+        self.assertFalse(self.runtime("controllers")["controllers"][1]["connected"])
+        # Idempotent release of an already-disconnected device is accepted.
+        self.assertTrue(self.rpc("controller-release right")["ok"])
+
+    def test_global_release_clears_controller_and_hmd_overrides(self):
+        for cmd in ("pose 10 20 30 1 0 0 0", "worn 1",
+                    "controller-pose left 1 2 3 1 0 0 0", "controller-pose right 4 5 6 1 0 0 0"):
+            self.assertTrue(self.rpc(cmd)["ok"])
+        s = self.rpc("release")
+        for hand in ("left", "right"):
+            self.assertFalse(s["controllers"][hand]["pose_override"])
+            self.assertIsNone(s["controllers"][hand]["pose"])
+        self.assertFalse(s["pose_override"])
+        self.assertIsNone(s["worn_override"])
+        self.assertEqual(self.runtime("metrics")["hmd_pose"][0], 42)
+        self.assertFalse(self.runtime("metrics")["worn"])
+        for c in self.runtime("controllers")["controllers"]:
+            self.assertFalse(c["connected"])
+            self.assertFalse(c["sample_connected"])
+
+    def test_controller_cleanup_disconnects_and_stops_all_ticks(self):
+        self.rpc("controller-pose left 1 2 3 1 0 0 0")
+        self.rpc("controller-pose right 4 5 6 1 0 0 0")
+        self.runtime("cleanup")
+        before = self.runtime("controllers")["controllers"]
+        for c in before:
+            self.assertFalse(c["connected"])
+            self.assertFalse(c["sample_connected"])
+        time.sleep(0.05)
+        self.assertEqual(before, self.runtime("controllers")["controllers"])
+        self.assertFalse(os.path.exists(self.sock))
+
+    def test_controller_activation_after_cleanup_is_rejected(self):
+        self.runtime("cleanup")
+        self.assertTrue(self.runtime("controller-late-activate")["rejected"])
+
+    def test_controller_deactivate_clears_readiness_without_stopping_other_hand(self):
+        self.rpc("controller-pose left 1 2 3 1 0 0 0")
+        self.rpc("controller-pose right 4 5 6 1 0 0 0")
+        self.runtime("controller-deactivate-left")
+        s = self.rpc("status")
+        self.assertEqual(s["controllers"]["left"], {"device_index": None, "pose_override": False, "pose": None, "synthetic": True})
+        self.assertEqual(s["hmd_index"], 7)
+        before = self.runtime("controllers")["controllers"]
+        self.assertFalse(before[0]["sample_connected"])
+        time.sleep(0.05)
+        after = self.runtime("controllers")["controllers"]
+        self.assertEqual(before[0]["count"], after[0]["count"])
+        self.assertGreater(after[1]["count"], before[1]["count"])
+        bad = self.rpc("controller-pose left 9 8 7 1 0 0 0")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"], "controller is not active")
+        self.assertEqual(bad["sequence"], s["sequence"])
+        self.runtime("controller-activate")
+        self.assertTrue(self.rpc("controller-pose left 9 8 7 1 0 0 0")["ok"])
+
+    def restart_runtime(self, **env):
+        self.p.communicate("quit\n", timeout=5)
+        self.assertEqual(self.p.returncode, 0)
+        self.p = subprocess.Popen([str(BUILD / "vrserver")], env=dict(self.env, **env),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert self.p.stdout is not None
+        self.assertEqual(self.p.stdout.readline().strip(), "ready")
+
+    def test_controller_readiness_waits_for_activation_and_registration_acceptance(self):
+        for env in ("FAKE_DEFER_CONTROLLERS", "FAKE_REJECT_CONTROLLERS"):
+            with self.subTest(env=env):
+                self.restart_runtime(**{env: "1"})
+                before = self.rpc("status")
+                for hand in ("left", "right"):
+                    self.assertIsNone(before["controllers"][hand]["device_index"])
+                    bad = self.rpc("controller-pose " + hand + " 1 2 3 1 0 0 0")
+                    self.assertFalse(bad["ok"])
+                    self.assertEqual(bad["error"], "controller is not active")
+                    self.assertEqual(bad["sequence"], before["sequence"])
+                self.assertTrue(self.rpc("pose 1 2 3 1 0 0 0")["ok"])
+                self.assertTrue(self.rpc("controller-release all")["ok"])
+                if env == "FAKE_DEFER_CONTROLLERS":
+                    self.runtime("controller-activate")
+                    self.assertTrue(self.rpc("controller-pose right 1 2 3 1 0 0 0")["ok"])
+
+    def test_controller_malformed_commands_do_not_mutate_any_channel(self):
+        for cmd in ("pose 10 20 30 1 0 0 0", "worn 1",
+                    "controller-pose left 1 2 3 1 0 0 0", "controller-pose right 4 5 6 1 0 0 0"):
+            self.assertTrue(self.rpc(cmd)["ok"])
+        before = self.rpc("status")
+        for cmd in ("controller-pose", "controller-pose all 1 2 3 1 0 0 0",
+                    "controller-pose LEFT 1 2 3 1 0 0 0", "controller-pose left 1 2 3",
+                    "controller-pose left nan 2 3 1 0 0 0", "controller-pose right 1 2 3 inf 0 0 0",
+                    "controller-pose left 1 2 3 0 0 0 0", "controller-pose right 1 2 3 1 0 0 0 extra",
+                    "controller-release", "controller-release both", "controller-release all extra"):
+            with self.subTest(cmd=cmd):
+                bad = self.rpc(cmd)
+                self.assertFalse(bad.pop("ok"))
+                self.assertTrue(bad.pop("error"))
+                self.assertEqual(bad, {k: v for k, v in before.items() if k != "ok"})
+
+    def test_concurrent_controller_commands_and_physical_updates_release_coherently(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def commands(hand):
+            for _ in range(25):
+                self.assertTrue(self.rpc("controller-pose " + hand + " 4 5 6 1 1 0 0")["ok"])
+                self.assertTrue(self.rpc("controller-release " + hand)["ok"])
+        def physical():
+            for _ in range(40):
+                self.runtime("physical")
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(commands, hand) for hand in ("left", "right")] + [pool.submit(physical)]
+            for f in futures:
+                f.result(timeout=5)
+        self.rpc("release")
+        before = self.runtime("controllers")["controllers"]
+        time.sleep(0.05)
+        self.assertEqual(before, self.runtime("controllers")["controllers"])
+        for c in before:
+            self.assertFalse(c["connected"])
+        self.assertEqual(self.runtime("metrics")["other_x"], 99)
+        self.assertTrue(self.runtime("forward")["controller_identity"])
+
     def test_raw_pose_persists_and_only_hmd_is_replaced(self):
         s = self.rpc("pose 1 2 3 2 0 0 0")
         self.assertTrue(s["ok"])

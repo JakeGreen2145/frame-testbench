@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <string>
 using namespace vr;
@@ -12,6 +13,42 @@ namespace {
 std::mutex mu;
 ITrackedDeviceServerDriver *hmd, *controller;
 DriverPose_t latest{};
+ITrackedDeviceServerDriver *synthetic[2]{};
+DriverPose_t synthetic_latest[2]{};
+unsigned synthetic_count[2]{};
+std::map<PropertyContainerHandle_t, std::map<ETrackedDeviceProperty, std::string>> strings;
+std::map<PropertyContainerHandle_t, int32_t> roles;
+bool raw_pose(const DriverPose_t &p) {
+    bool raw = p.qWorldFromDriverRotation.w == 1 && p.qWorldFromDriverRotation.x == 0 &&
+        p.qWorldFromDriverRotation.y == 0 && p.qWorldFromDriverRotation.z == 0 &&
+        p.qDriverFromHeadRotation.w == 1 && p.qDriverFromHeadRotation.x == 0 &&
+        p.qDriverFromHeadRotation.y == 0 && p.qDriverFromHeadRotation.z == 0 && p.poseTimeOffset == 0;
+    for (int k = 0; k < 3; ++k) raw = raw && p.vecWorldFromDriverTranslation[k] == 0 &&
+        p.vecDriverFromHeadTranslation[k] == 0 && p.vecVelocity[k] == 0 && p.vecAngularVelocity[k] == 0 &&
+        p.vecAcceleration[k] == 0 && p.vecAngularAcceleration[k] == 0;
+    return raw;
+}
+void controller_metrics() {
+    // GetPose is a runtime callback, not a cached copy of the publisher metrics.
+    DriverPose_t sampled[2]{};
+    for (int k = 0; k < 2; ++k) if (synthetic[k]) sampled[k] = synthetic[k]->GetPose();
+    std::lock_guard<std::mutex> lock(mu);
+    std::cout << "{\"controllers\":[";
+    for (int k = 0; k < 2; ++k) {
+        if (k) std::cout << ',';
+        auto &p = synthetic_latest[k]; auto &s = sampled[k];
+        std::cout << "{\"registered\":" << bool(synthetic[k]) << ",\"count\":" << synthetic_count[k]
+          << ",\"position\":[" << p.vecPosition[0] << ',' << p.vecPosition[1] << ',' << p.vecPosition[2]
+          << "],\"quaternion\":[" << p.qRotation.w << ',' << p.qRotation.x << ',' << p.qRotation.y << ',' << p.qRotation.z
+          << "],\"connected\":" << p.deviceIsConnected << ",\"valid\":" << p.poseIsValid
+          << ",\"raw\":" << raw_pose(p) << ",\"running\":" << (p.result == TrackingResult_Running_OK)
+          << ",\"sample_connected\":" << s.deviceIsConnected << ",\"sample_valid\":" << s.poseIsValid
+          << ",\"sample_x\":" << s.vecPosition[0] << ",\"sample_qw\":" << s.qRotation.w
+          << ",\"role\":" << roles[120 + k] << ",\"serial\":\"" << strings[120 + k][Prop_SerialNumber_String]
+          << "\",\"render_model\":\"" << strings[120 + k][Prop_RenderModelName_String] << "\"}";
+    }
+    std::cout << "]}" << std::endl;
+}
 double other_x = 0;
 bool worn = false, other_worn = true;
 unsigned pose_count = 0, worn_count = 0, host_mask = 0, input_mask = 0;
@@ -20,11 +57,30 @@ class Host : public IVRServerDriverHost {
 public:
     bool TrackedDeviceAdded(const char *s, ETrackedDeviceClass c, ITrackedDeviceServerDriver *d) override {
         if (c == TrackedDeviceClass_HMD) { assert(!strcmp(s, "cv-real-hmd")); hmd = d; assert(d->Activate(7) == VRInitError_None); }
-        else { assert(c == TrackedDeviceClass_Controller && !strcmp(s, "cv-controller")); controller = d; }
+        else if (!strcmp(s, "cv-controller")) { assert(c == TrackedDeviceClass_Controller); controller = d; }
+        else {
+            assert(c == TrackedDeviceClass_Controller);
+            int k = !strcmp(s, "frame_testbench_left") ? 0 : 1;
+            assert(k == 0 || !strcmp(s, "frame_testbench_right"));
+            assert(!synthetic[k]);
+            if (std::getenv("FAKE_REJECT_CONTROLLERS")) return false;
+            synthetic[k] = d;
+            // Probe GetPose before activation and reenter state during synchronous Activate.
+            auto p = d->GetPose(); assert(raw_pose(p) && !p.deviceIsConnected && !p.poseIsValid && p.qRotation.w == 1);
+            if (!std::getenv("FAKE_DEFER_CONTROLLERS")) assert(d->Activate(20 + k) == VRInitError_None);
+        }
         return true;
     }
     void TrackedDevicePoseUpdated(uint32_t i, const DriverPose_t &p, uint32_t size) override {
-        assert(size == sizeof(p)); std::lock_guard<std::mutex> lock(mu);
+        assert(size == sizeof(p));
+        if (i == 20 || i == 21) {
+            // Runtime callbacks can synchronously query the very device being published.
+            auto sample = synthetic[i - 20]->GetPose();
+            assert(sample.deviceIsConnected == p.deviceIsConnected && sample.vecPosition[0] == p.vecPosition[0]);
+            std::lock_guard<std::mutex> lock(mu);
+            synthetic_latest[i - 20] = p; ++synthetic_count[i - 20]; return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
         if (i == 7) { latest = p; ++pose_count; } else { assert(i == 9); other_x = p.vecPosition[0]; }
     }
     void VsyncEvent(double t) override { assert(t == 0.125); host_mask |= 1; }
@@ -68,7 +124,20 @@ public:
 class Properties : public IVRProperties {
 public:
     ETrackedPropertyError ReadPropertyBatch(PropertyContainerHandle_t, PropertyRead_t *, uint32_t) override { return TrackedProp_Success; }
-    ETrackedPropertyError WritePropertyBatch(PropertyContainerHandle_t, PropertyWrite_t *, uint32_t) override { return TrackedProp_Success; }
+    ETrackedPropertyError WritePropertyBatch(PropertyContainerHandle_t c, PropertyWrite_t *writes, uint32_t count) override {
+        assert(c == 120 || c == 121);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto &w = writes[i];
+            assert(w.writeType == PropertyWrite_Set);
+            if (w.unTag == k_unStringPropertyTag) strings[c][w.prop] = static_cast<const char *>(w.pvBuffer);
+            if (w.prop == Prop_ControllerRoleHint_Int32) {
+                assert(w.unTag == k_unInt32PropertyTag && w.unBufferSize == sizeof(int32_t));
+                roles[c] = *static_cast<int32_t *>(w.pvBuffer);
+            }
+            w.eError = TrackedProp_Success;
+        }
+        return TrackedProp_Success;
+    }
     const char *GetPropErrorNameFromEnum(ETrackedPropertyError) override { return "success"; }
     PropertyContainerHandle_t TrackedDeviceToPropertyContainer(TrackedDeviceIndex_t i) override { return 100 + i; }
 } properties;
@@ -130,6 +199,27 @@ int main(int argc, char **) {
         if (cmd == "physical") { physical(); metrics(); }
         else if (cmd == "deactivate") { hmd->Deactivate(); std::cout << "{\"deactivated\":" << ((lifecycle() & 2) != 0) << "}" << std::endl; }
         else if (cmd == "metrics") metrics();
+        else if (cmd == "controllers") controller_metrics();
+        else if (cmd == "controller-deactivate-left") { assert(synthetic[0]); synthetic[0]->Deactivate(); controller_metrics(); }
+        else if (cmd == "controller-activate") {
+            for (int k = 0; k < 2; ++k) if (synthetic[k]) assert(synthetic[k]->Activate(20 + k) == VRInitError_None);
+            controller_metrics();
+        }
+        else if (cmd == "controller-late-activate") {
+            assert(cleaned);
+            bool rejected = true;
+            for (int k = 0; k < 2; ++k) if (synthetic[k])
+                rejected = (synthetic[k]->Activate(20 + k) != VRInitError_None) && rejected;
+            std::cout << "{\"rejected\":" << rejected << "}" << std::endl;
+        }
+        else if (cmd == "controller-methods") {
+            for (auto *d : synthetic) {
+                assert(d); d->EnterStandby(); assert(!d->GetComponent("unknown"));
+                char response[2] = {'x', 'x'}; d->DebugRequest("ignored", response, sizeof(response)); assert(response[0] == 0);
+                d->DebugRequest("ignored", nullptr, 0);
+            }
+            std::cout << "{\"ok\":true}" << std::endl;
+        }
         else if (cmd == "cleanup") { provider->Cleanup(); cleaned = true; std::cout << "{\"cleaned\":" << ((lifecycle() & 16) != 0) << "}" << std::endl; }
         else if (cmd == "forward") {
             provider->RunFrame(); provider->EnterStandby(); provider->LeaveStandby(); assert(provider->ShouldBlockStandbyMode());

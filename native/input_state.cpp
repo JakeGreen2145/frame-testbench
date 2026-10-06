@@ -29,27 +29,49 @@ void pose_json(std::ostream &o, const std::optional<DriverPose_t> &p) {
 }
 }
 void InputState::reset(IVRServerDriverHost *h, IVRDriverInput *i) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     host_ = h; input_ = i; index_ = k_unTrackedDeviceIndexInvalid; container_ = 0;
     physical_.reset(); requested_.reset(); worn_.reset(); proximity_.clear(); sequence_ = 0;
+    controllers_ = {};
 }
 void InputState::activate(uint32_t i, PropertyContainerHandle_t c) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     index_ = i; container_ = c; physical_.reset(); proximity_.clear(); ++sequence_;
 }
 void InputState::deactivate(uint32_t i) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (index_ != i) return;
     index_ = k_unTrackedDeviceIndexInvalid; container_ = 0; proximity_.clear(); physical_.reset(); ++sequence_;
 }
+void InputState::controller_activate(unsigned hand, uint32_t index) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    controllers_.at(hand).index = index; ++sequence_;
+    if (host_) {
+        const auto pose = controller_pose(hand);
+        host_->TrackedDevicePoseUpdated(index, pose, sizeof(pose));
+    }
+}
+void InputState::controller_deactivate(unsigned hand) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    controllers_.at(hand) = {}; ++sequence_;
+}
+DriverPose_t InputState::controller_pose(unsigned hand) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const auto &c = controllers_.at(hand);
+    if (c.index != k_unTrackedDeviceIndexInvalid && c.requested) return *c.requested;
+    DriverPose_t p{};
+    p.qRotation.w = p.qWorldFromDriverRotation.w = p.qDriverFromHeadRotation.w = 1;
+    p.result = TrackingResult_Uninitialized;
+    return p;
+}
 void InputState::component(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t h) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (container_ && c == container_ && n && !strcmp(n, "/proximity")) {
         proximity_.emplace(h, Proximity{}); ++sequence_;
     }
 }
 void InputState::physical_pose(uint32_t i, const DriverPose_t &p, uint32_t size) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (i == index_) {
         if (size == sizeof(p)) physical_ = p;
         if (requested_) return;
@@ -57,7 +79,7 @@ void InputState::physical_pose(uint32_t i, const DriverPose_t &p, uint32_t size)
     host_->TrackedDevicePoseUpdated(i, p, size);
 }
 EVRInputError InputState::physical_boolean(VRInputComponentHandle_t h, bool value, double offset) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto it = proximity_.find(h);
     if (it != proximity_.end()) {
         it->second.physical = value; it->second.offset = offset;
@@ -65,12 +87,25 @@ EVRInputError InputState::physical_boolean(VRInputComponentHandle_t h, bool valu
     }
     return input_->UpdateBooleanComponent(h, value, offset);
 }
+void InputState::controller_release_locked(unsigned hand) {
+    auto &c = controllers_.at(hand);
+    const bool was_connected = bool(c.requested);
+    c.requested.reset();
+    if (was_connected && host_ && c.index != k_unTrackedDeviceIndexInvalid) {
+        const auto pose = controller_pose(hand);
+        host_->TrackedDevicePoseUpdated(c.index, pose, sizeof(pose));
+    }
+}
 void InputState::publish_locked() {
+    for (const auto &c : controllers_) if (host_ && c.index != k_unTrackedDeviceIndexInvalid && c.requested) {
+        const auto pose = *c.requested;
+        host_->TrackedDevicePoseUpdated(c.index, pose, sizeof(pose));
+    }
     if (index_ == k_unTrackedDeviceIndexInvalid) return;
     if (requested_ && host_) host_->TrackedDevicePoseUpdated(index_, *requested_, sizeof(DriverPose_t));
     if (worn_ && input_) for (const auto &entry : proximity_) input_->UpdateBooleanComponent(entry.first, *worn_, 0);
 }
-void InputState::tick() { std::lock_guard<std::mutex> lock(mutex_); publish_locked(); }
+void InputState::tick() { std::lock_guard<std::recursive_mutex> lock(mutex_); publish_locked(); }
 std::string InputState::status_locked(bool ok, const char *error) {
     std::ostringstream o; o.imbue(std::locale::classic()); o << std::setprecision(17) << std::boolalpha;
     o << "{\"ok\":" << ok << ",\"sequence\":" << sequence_ << ",\"hmd_index\":";
@@ -93,12 +128,22 @@ std::string InputState::status_locked(bool ok, const char *error) {
         o << '[' << p.vecPosition[0] << ',' << p.vecPosition[1] << ',' << p.vecPosition[2] << ','
           << p.qRotation.w << ',' << p.qRotation.x << ',' << p.qRotation.y << ',' << p.qRotation.z << ']';
     }
+    o << ",\"controllers\":{";
+    for (unsigned hand = 0; hand < controllers_.size(); ++hand) {
+        const auto &c = controllers_[hand];
+        if (hand) o << ',';
+        o << '\"' << (hand == 0 ? "left" : "right") << "\":{\"device_index\":";
+        if (c.index == k_unTrackedDeviceIndexInvalid) o << "null"; else o << c.index;
+        o << ",\"pose_override\":" << bool(c.requested) << ",\"pose\":";
+        pose_json(o, c.requested); o << ",\"synthetic\":true}";
+    }
+    o << '}';
     if (error) o << ",\"error\":\"" << error << '\"'; // Internal fixed strings, never unescaped user data.
     o << "}\n";
     return o.str();
 }
 std::string InputState::command(const std::string &line) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::istringstream in(line); in.imbue(std::locale::classic());
     std::string operation, extra;
     in >> operation;
@@ -106,7 +151,14 @@ std::string InputState::command(const std::string &line) {
         if (in >> extra) return status_locked(false, "status takes no arguments");
         return status_locked(true, nullptr);
     }
-    if (operation == "pose") {
+    if (operation == "pose" || operation == "controller-pose") {
+        int hand = -1;
+        if (operation == "controller-pose") {
+            std::string side;
+            if (!(in >> side) || (side != "left" && side != "right"))
+                return status_locked(false, "controller-pose needs left or right");
+            hand = side == "left" ? 0 : 1;
+        }
         double values[7];
         for (auto &v : values) if (!(in >> v) || !std::isfinite(v)) return status_locked(false, "pose needs seven finite numbers");
         if (in >> extra) return status_locked(false, "pose needs seven finite numbers");
@@ -116,14 +168,24 @@ std::string InputState::command(const std::string &line) {
         double norm = 0;
         for (int i = 3; i < 7; ++i) { values[i] /= scale; norm += values[i] * values[i]; }
         norm = std::sqrt(norm);
-        if (!host_ || index_ == k_unTrackedDeviceIndexInvalid) return status_locked(false, "HMD is not active");
+        if (hand >= 0) {
+            if (!host_ || controllers_[hand].index == k_unTrackedDeviceIndexInvalid)
+                return status_locked(false, "controller is not active");
+        } else if (!host_ || index_ == k_unTrackedDeviceIndexInvalid) return status_locked(false, "HMD is not active");
         DriverPose_t p{};
         for (int i = 0; i < 3; ++i) p.vecPosition[i] = values[i];
         p.qRotation = {values[3] / norm, values[4] / norm, values[5] / norm, values[6] / norm};
         p.qWorldFromDriverRotation.w = p.qDriverFromHeadRotation.w = 1;
         p.poseIsValid = p.deviceIsConnected = true;
         p.result = TrackingResult_Running_OK;
-        requested_ = p;
+        if (hand >= 0) controllers_[hand].requested = p;
+        else requested_ = p;
+    } else if (operation == "controller-release") {
+        std::string side;
+        if (!(in >> side) || (side != "left" && side != "right" && side != "all") || (in >> extra))
+            return status_locked(false, "controller-release needs left, right or all");
+        if (side != "right") controller_release_locked(0);
+        if (side != "left") controller_release_locked(1);
     } else if (operation == "worn") {
         std::string value;
         if (!(in >> value) || (value != "0" && value != "1") || (in >> extra))
@@ -132,6 +194,8 @@ std::string InputState::command(const std::string &line) {
         worn_ = value == "1";
     } else if (operation == "release" || operation == "pose-release" || operation == "worn-release") {
         if (in >> extra) return status_locked(false, "release takes no arguments");
+        if (operation == "release") for (unsigned hand = 0; hand < controllers_.size(); ++hand)
+            controller_release_locked(hand);
         if (operation != "worn-release") {
             if (requested_ && physical_ && host_ && index_ != k_unTrackedDeviceIndexInvalid)
                 host_->TrackedDevicePoseUpdated(index_, *physical_, sizeof(DriverPose_t));

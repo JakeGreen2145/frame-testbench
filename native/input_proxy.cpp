@@ -97,10 +97,39 @@ public:
     }
     DriverHandle_t GetDriverHandle() override { return real->GetDriverHandle(); }
 };
+// Provider-owned synthetic devices never wrap or take ownership of physical controllers.
+class Controller final : public ITrackedDeviceServerDriver {
+    InputState &state_;
+    unsigned hand_;
+public:
+    IVRProperties *properties = nullptr;
+    Controller(InputState &state, unsigned hand) : state_(state), hand_(hand) {}
+    const char *serial() const { return hand_ == 0 ? "frame_testbench_left" : "frame_testbench_right"; }
+    EVRInitError Activate(uint32_t index) override {
+        if (!properties || index == k_unTrackedDeviceIndexInvalid) return VRInitError_Driver_Failed;
+        CVRPropertyHelpers props(properties);
+        const auto container = props.TrackedDeviceToPropertyContainer(index);
+        if (!container) return VRInitError_Driver_Failed;
+        if (props.SetStringProperty(container, Prop_SerialNumber_String, serial()) != TrackedProp_Success ||
+            props.SetStringProperty(container, Prop_RenderModelName_String, "generic_controller") != TrackedProp_Success ||
+            props.SetInt32Property(container, Prop_ControllerRoleHint_Int32,
+                hand_ == 0 ? TrackedControllerRole_LeftHand : TrackedControllerRole_RightHand) != TrackedProp_Success)
+            return VRInitError_Driver_Failed;
+        state_.controller_activate(hand_, index);
+        return VRInitError_None;
+    }
+    void Deactivate() override { state_.controller_deactivate(hand_); }
+    void EnterStandby() override {}
+    void *GetComponent(const char *) override { return nullptr; }
+    void DebugRequest(const char *, char *response, uint32_t size) override { if (response && size) response[0] = 0; }
+    DriverPose_t GetPose() override { return state_.controller_pose(hand_); }
+};
+
 class Provider final : public IServerTrackedDeviceProvider {
     InputState state_;
     Context context_{state_};
     Control control_{state_};
+    Controller left_{state_, 0}, right_{state_, 1};
 public:
     IServerTrackedDeviceProvider *real = nullptr;
     EVRInitError Init(IVRDriverContext *context) override {
@@ -116,9 +145,24 @@ public:
             real->Cleanup(); context_.host.clear();
             return VRInitError_Driver_Failed;
         }
+        // The runtime may synchronously call Activate or GetPose during registration.
+        // Never hold the state lock here. Device storage lasts as long as the provider.
+        for (auto *controller : {&left_, &right_}) {
+            controller->properties = context_.host.properties;
+            if (context_.host.real && !context_.host.real->TrackedDeviceAdded(
+                    controller->serial(), TrackedDeviceClass_Controller, controller))
+                controller->Deactivate();
+        }
         return VRInitError_None;
     }
-    void Cleanup() override { control_.stop(); real->Cleanup(); context_.host.clear(); }
+    void Cleanup() override {
+        control_.stop();
+        state_.command("controller-release all");
+        left_.Deactivate(); right_.Deactivate();
+        left_.properties = right_.properties = nullptr;
+        real->Cleanup(); context_.host.clear();
+        state_.reset(nullptr, nullptr);
+    }
     const char *const *GetInterfaceVersions() override { return real->GetInterfaceVersions(); }
     void RunFrame() override { real->RunFrame(); }
     bool ShouldBlockStandbyMode() override { return real->ShouldBlockStandbyMode(); }

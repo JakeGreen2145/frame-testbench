@@ -39,8 +39,9 @@ The loader matches only that exact absolute path, not substrings, relative paths
 other modules, dlopen(NULL), or alternate spellings. The proxy loads cv through
 frame_real_dlopen, which calls the un-interposed RTLD_NEXT dlopen. This keeps the
 real cv module at its original path and preserves its $ORIGIN dependencies. No
-/opt modifications, vtable patches, device registrations, or settings writes are
-performed. Provider004, host006, and input004 use the pinned public Valve header.
+/opt modifications, vtable patches, or settings writes are performed. The proxy
+registers two additional synthetic controller devices through the public host ABI.
+Provider004, host006, and input004 use the pinned public Valve header.
 All other requested interface versions pass through unchanged.
 
 Installation, service environment, initial restart, live acceptance, and recovery
@@ -68,6 +69,8 @@ Up to 32 concurrent clients are serviced without blocking the nominal 90Hz tick.
 ```text
 status
 pose x y z qw qx qy qz
+controller-pose left|right x y z qw qx qy qz
+controller-release left|right|all
 worn 0
 worn 1
 release
@@ -84,19 +87,56 @@ and TrackingResult_Running_OK. This is a stationary pose, not a trajectory.
 
 Only the activated cv HMD index and /proximity components belonging to its exact
 property container are intercepted. Every matching proximity handle is supported.
-Controllers and other components are forwarded unchanged. Real HMD pose and
+Physical controllers and other components are forwarded unchanged. Real HMD pose and
 proximity updates are cached but suppressed independently while their respective
 override is enabled. Commands publish immediately; the worker republishes at a
 nominal 90Hz even without physical updates or provider RunFrame calls.
 
-release clears both overrides. The selective releases clear only their named
-channel. Release immediately forwards its latest cached physical sample, including
-original driver transforms and validity. If no physical sample has arrived yet,
+release clears HMD pose, worn, and both synthetic controller overrides.
+pose-release and worn-release clear only their named HMD channel.
+controller-release clears one hand or both with all, without releasing HMD channels.
+Releasing an HMD channel immediately forwards its latest cached physical sample,
+including original driver transforms and validity. If no physical sample has arrived yet,
 that channel resumes forwarding at the next physical update. No physical state is
 invented. Cached samples can be stale when cv is in standby.
 
-Deactivate clears readiness and stops publication before forwarding the real
-Deactivate. Cleanup joins the worker before calling real provider Cleanup.
+HMD Deactivate clears its readiness and stops HMD publication before forwarding
+the real Deactivate. Cleanup joins the worker, disconnects synthetic controllers,
+clears their readiness, then calls real provider Cleanup.
+
+## Synthetic controllers
+
+The provider registers frame_testbench_left and frame_testbench_right as separate
+TrackedDeviceClass_Controller devices. Each has its explicit left/right role hint
+and the built-in generic_controller render model. They never wrap a physical
+controller or depend on one waking up. No buttons, haptics, or physical-controller
+input profile are advertised. These are pose-only devices; action-based input
+bindings and application-specific rendering need separate live verification.
+
+Registration runs outside the state lock because the runtime can synchronously
+call Activate and GetPose. The devices live for the provider's lifetime. Failed
+registration or missing activation leaves device_index null; controller-pose
+then returns ok:false with error:"controller is not active". HMD commands remain
+available if only controller registration fails.
+
+Activate publishes a disconnected, invalid pose with identity rotations, zero
+translations and velocities, and TrackingResult_Uninitialized. A controller-pose
+command connects that hand with a valid pose using the same RAW coordinate and
+quaternion rules as the HMD pose command. Each hand persists independently and
+publishes immediately and at the nominal 90Hz tick, even when the physical HMD
+is invalid, inactive, or not producing updates. GetPose returns the selected pose.
+
+controller-release clears the selected request and immediately publishes the
+explicit disconnected pose. It then stops ticking that hand; status pose becomes
+null while device_index remains assigned. Release of an inactive or already
+released hand is accepted. Runtime Deactivate clears that hand's request and
+index and stops publication, without changing the other hand or HMD. Unlike HMD
+overrides, controller requests do not survive Deactivate. Provider Cleanup also
+rejects subsequent controller activation until another Init.
+
+The state lock serializes publication, release and deactivation. It permits
+same-thread runtime callbacks such as GetPose during TrackedDevicePoseUpdated;
+registration and property writes do not hold that lock.
 
 ## Response fields
 
@@ -122,6 +162,11 @@ Every response, including rejected commands, contains:
 * hmd_container: captured property container, zero when inactive.
 * proximity_ready: boolean, true when a matching /proximity handle is captured.
 * proximity_handles: all captured matching handles.
+* controllers: object with left and right keys. Each value contains:
+  * device_index: assigned synthetic index, or null before activation/after deactivation.
+  * pose_override: boolean, true when this hand has a requested pose.
+  * pose: requested pose in the same shape as the HMD pose field, or null when released.
+  * synthetic: always true. These are not captured physical controllers.
 * error: fixed explanatory string on rejected requests.
 
 Pose and worn commands reject missing HMD/proximity readiness. On Deactivate the
