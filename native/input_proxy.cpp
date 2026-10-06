@@ -103,19 +103,34 @@ class Controller final : public ITrackedDeviceServerDriver {
     unsigned hand_;
 public:
     IVRProperties *properties = nullptr;
+    IVRDriverInput *input = nullptr;
     Controller(InputState &state, unsigned hand) : state_(state), hand_(hand) {}
     const char *serial() const { return hand_ == 0 ? "frame_testbench_left" : "frame_testbench_right"; }
     EVRInitError Activate(uint32_t index) override {
-        if (!properties || index == k_unTrackedDeviceIndexInvalid) return VRInitError_Driver_Failed;
+        if (!properties || !input || index == k_unTrackedDeviceIndexInvalid) return VRInitError_Driver_Failed;
         CVRPropertyHelpers props(properties);
         const auto container = props.TrackedDeviceToPropertyContainer(index);
         if (!container) return VRInitError_Driver_Failed;
         if (props.SetStringProperty(container, Prop_SerialNumber_String, serial()) != TrackedProp_Success ||
             props.SetStringProperty(container, Prop_RenderModelName_String, "generic_controller") != TrackedProp_Success ||
+            props.SetStringProperty(container, Prop_ControllerType_String, "frame_controller") != TrackedProp_Success ||
+            props.SetStringProperty(container, Prop_InputProfilePath_String, "{frame_controller}/input/frame_controller_profile.json") != TrackedProp_Success ||
+            props.SetStringProperty(container, Prop_ModelNumber_String, "Steam Frame Controller") != TrackedProp_Success ||
+            props.SetStringProperty(container, Prop_ManufacturerName_String, "Valve") != TrackedProp_Success ||
             props.SetInt32Property(container, Prop_ControllerRoleHint_Int32,
                 hand_ == 0 ? TrackedControllerRole_LeftHand : TrackedControllerRole_RightHand) != TrackedProp_Success)
             return VRInitError_Driver_Failed;
-        state_.controller_activate(hand_, index);
+        auto components = controller_input_schema(hand_);
+        for (auto &entry : components) {
+            auto &c = entry.second;
+            c.creation_error = c.boolean ? input->CreateBooleanComponent(container, entry.first.c_str(), &c.handle) :
+                input->CreateScalarComponent(container, entry.first.c_str(), &c.handle, VRScalarType_Absolute,
+                    c.two_sided ? VRScalarUnits_NormalizedTwoSided : VRScalarUnits_NormalizedOneSided);
+            if (c.creation_error == VRInputError_None && c.handle == k_ulInvalidInputComponentHandle)
+                c.creation_error = VRInputError_InvalidHandle;
+            if (c.creation_error != VRInputError_None) c.handle = k_ulInvalidInputComponentHandle;
+        }
+        state_.controller_activate(hand_, index, std::move(components));
         return VRInitError_None;
     }
     void Deactivate() override { state_.controller_deactivate(hand_); }
@@ -149,6 +164,7 @@ public:
         // Never hold the state lock here. Device storage lasts as long as the provider.
         for (auto *controller : {&left_, &right_}) {
             controller->properties = context_.host.properties;
+            controller->input = context_.input.real;
             if (context_.host.real && !context_.host.real->TrackedDeviceAdded(
                     controller->serial(), TrackedDeviceClass_Controller, controller))
                 controller->Deactivate();
@@ -160,6 +176,7 @@ public:
         state_.command("controller-release all");
         left_.Deactivate(); right_.Deactivate();
         left_.properties = right_.properties = nullptr;
+        left_.input = right_.input = nullptr;
         real->Cleanup(); context_.host.clear();
         state_.reset(nullptr, nullptr);
     }

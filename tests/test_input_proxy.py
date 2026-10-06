@@ -13,6 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "input-tests"
 
 
+def expected_inputs(hand):
+    buttons = ["system", "bumper", "trigger", "grip", "thumbstick"]
+    buttons += (["view", "dpad_up", "dpad_right", "dpad_down", "dpad_left"]
+                if hand == "left" else ["menu", "a", "b", "x", "y"])
+    values = {f"/input/{button}/{kind}": False for button in buttons for kind in ("click", "touch")}
+    values["/input/thumbrest/touch"] = False
+    values.update({f"/input/{path}": 0.0 for path in ("trigger/value", "grip/value", "thumbstick/x", "thumbstick/y")})
+    return values
+
+
 class InputProxyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -80,7 +90,7 @@ class InputProxyTests(unittest.TestCase):
         self.assertIn("controllers", s)
         r = self.runtime("controllers")["controllers"]
         for k, hand in enumerate(("left", "right")):
-            self.assertEqual(s["controllers"][hand], {"device_index": 20 + k, "pose_override": False, "pose": None, "synthetic": True})
+            self.assertEqual(s["controllers"][hand], {"device_index": 20 + k, "pose_override": False, "pose": None, "synthetic": True, "inputs_ready": True, "inputs": expected_inputs(hand), "input_error": None})
             self.assertTrue(r[k]["registered"])
             self.assertGreater(r[k]["count"], 0)
             self.assertTrue(r[k]["raw"])
@@ -94,6 +104,227 @@ class InputProxyTests(unittest.TestCase):
             self.assertTrue(r[k]["render_model"])
         self.assertTrue(self.runtime("controller-methods")["ok"])
         self.assertTrue(self.runtime("forward")["controller_identity"])
+
+    def test_frame_input_registration_exact_paths_types_and_units(self):
+        status = self.rpc("status")
+        runtime = self.runtime("controllers")["controllers"]
+        components = self.runtime("inputs")["components"]
+        self.assertEqual(len(components), 50)
+        self.assertEqual(len({c["handle"] for c in components}), 50)
+        for k, hand in enumerate(("left", "right")):
+            with self.subTest(hand=hand):
+                self.assertEqual(runtime[k]["controller_type"], "frame_controller")
+                self.assertEqual(runtime[k]["input_profile"], "{frame_controller}/input/frame_controller_profile.json")
+                self.assertEqual(runtime[k]["manufacturer"], "Valve")
+                self.assertEqual(runtime[k]["model"], "Steam Frame Controller")
+                wanted = expected_inputs(hand)
+                actual = {c["path"]: c for c in components if c["container"] == 120 + k}
+                self.assertEqual(actual.keys(), wanted.keys())
+                cstatus = status["controllers"][hand]
+                self.assertTrue(cstatus["inputs_ready"])
+                self.assertEqual(cstatus["inputs"], wanted)
+                for path, value in wanted.items():
+                    c = actual[path]
+                    self.assertEqual(c["boolean"], isinstance(value, bool), path)
+                    self.assertEqual(type(cstatus["inputs"][path]), bool if isinstance(value, bool) else int)
+                    self.assertTrue(c["absolute"])
+                    self.assertEqual(c["two_sided"], path in ("/input/thumbstick/x", "/input/thumbstick/y"))
+                    self.assertEqual(c["value"], 0)
+                    self.assertGreaterEqual(c["updates"], 1)
+
+    def test_frame_input_registration_failure_never_claims_readiness(self):
+        for env in ({"FAKE_CREATE_FAILURE": "/input/trigger/value"}, {"FAKE_INVALID_HANDLE": "1"}):
+            with self.subTest(env=env):
+                self.restart_runtime(**env)
+                status = self.rpc("status")
+                for hand in ("left", "right"):
+                    c = status["controllers"][hand]
+                    self.assertFalse(c.get("inputs_ready", True))
+                    self.assertIsNotNone(c["input_error"])
+                    self.assertNotIn("/input/trigger/value", c["inputs"])
+                    self.assertTrue(self.rpc(f"controller-pose {hand} 0 0 0 1 0 0 0")["ok"])
+                    self.assertFalse(self.rpc(f"controller-inputs {hand} /input/system/click 1")["ok"])
+
+    def connect_controllers(self):
+        for hand in ("left", "right"):
+            self.assertTrue(self.rpc(f"controller-pose {hand} 1 2 3 1 0 0 0")["ok"])
+
+    def runtime_inputs(self, hand):
+        container = 120 if hand == "left" else 121
+        return {c["path"]: c["value"] for c in self.runtime("inputs")["components"]
+                if c["container"] == container and c["live"]}
+
+    def test_frame_inputs_publish_every_component_and_preserve_physical_input(self):
+        self.connect_controllers()
+        for hand in ("left", "right"):
+            values = {path: (True if isinstance(value, bool) else
+                            -0.75 if path.endswith(("/x", "/y")) else 0.625)
+                      for path, value in expected_inputs(hand).items()}
+            command = "controller-inputs " + hand + " " + " ".join(
+                f"{path} {int(value) if isinstance(value, bool) else value}" for path, value in values.items())
+            result = self.rpc(command)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["controllers"][hand]["inputs"], values)
+            self.assertEqual(self.runtime_inputs(hand), values)
+        before = self.rpc("status")["controllers"]
+        self.runtime("physical")
+        self.assertTrue(self.runtime("forward")["all_forwarded"])
+        self.assertFalse(self.runtime("metrics")["other_worn"])
+        self.assertEqual(self.runtime("metrics")["other_x"], 99)
+        time.sleep(0.03)
+        self.assertEqual(self.rpc("status")["controllers"], before)
+        # A publication stores the float delivered to the SDK, not the unrounded request.
+        result = self.rpc("controller-inputs left /input/trigger/value 0.1")
+        self.assertTrue(result["ok"])
+        import struct
+        self.assertEqual(result["controllers"]["left"]["inputs"]["/input/trigger/value"],
+                         struct.unpack("f", struct.pack("f", 0.1))[0])
+
+    def test_frame_inputs_validate_complete_batch_before_any_write(self):
+        self.connect_controllers()
+        self.assertTrue(self.rpc("controller-inputs left /input/trigger/value 0.5 /input/system/click 1")["ok"])
+        before = self.rpc("status")
+        runtime_before = self.runtime("inputs")
+        commands = ["controller-inputs", "controller-inputs all /input/system/click 1",
+                    "controller-inputs LEFT /input/system/click 1", "controller-inputs left",
+                    "controller-inputs left /input/system/click", "controller-inputs left /input/menu/click 1",
+                    "controller-inputs right /input/view/touch 1", "controller-input-release",
+                    "controller-input-release both", "controller-input-release left extra"]
+        for path in ("/input/thumbrest/click", "/input/trigger", "/input/skeleton/left", "/output/haptic", "/input/nope/click"):
+            commands.append(f"controller-inputs left /input/grip/value 1 {path} 1")
+        for value in ("true", "false", "2", "-1", "0.0", "1.0", "+1", "01", "nan", "1junk"):
+            commands.append(f"controller-inputs left /input/grip/value 1 /input/system/click {value}")
+        for path in ("/input/trigger/value", "/input/grip/value", "/input/thumbstick/x", "/input/thumbstick/y"):
+            for value in ("nan", "NaN", "inf", "-inf", "1e999", "1.00000001", "-1.00000001", "0.5junk"):
+                commands.append(f"controller-inputs left /input/system/click 0 {path} {value}")
+        commands += ["controller-inputs left /input/trigger/value -0.01",
+                     "controller-inputs left /input/grip/value -1",
+                     "controller-inputs left /input/system/click 0 /input/system/click 1",
+                     "controller-inputs left /input/trigger/value 1 /input/trigger/value 0"]
+        for command in commands:
+            with self.subTest(command=command):
+                bad = self.rpc(command)
+                self.assertFalse(bad.pop("ok"))
+                self.assertTrue(bad.pop("error"))
+                self.assertEqual(bad, {k: v for k, v in before.items() if k != "ok"})
+                self.assertEqual(self.runtime("inputs"), runtime_before)
+
+    def test_frame_inputs_require_connected_pose_and_accept_scalar_boundaries(self):
+        before = self.runtime("inputs")
+        for hand in ("left", "right"):
+            bad = self.rpc(f"controller-inputs {hand} /input/system/click 1")
+            self.assertFalse(bad["ok"])
+            self.assertEqual(bad["error"], "controller pose is not connected")
+        self.assertEqual(self.runtime("inputs"), before)
+        self.connect_controllers()
+        for value in (0, 1):
+            self.assertTrue(self.rpc(f"controller-inputs left /input/trigger/value {value} /input/grip/value {value}")["ok"])
+        for value in (-1, 0, 1):
+            self.assertTrue(self.rpc(f"controller-inputs right /input/thumbstick/x {value} /input/thumbstick/y {value}")["ok"])
+
+    def test_frame_inputs_report_partial_runtime_failure_and_recover(self):
+        self.connect_controllers()
+        self.runtime("fail-input /input/trigger/value")
+        before = self.rpc("status")
+        bad = self.rpc("controller-inputs left /input/system/click 1 /input/trigger/value 0.5 /input/grip/value 1")
+        self.assertFalse(bad["ok"])
+        self.assertIn("earlier writes may have applied", bad["error"])
+        c = bad["controllers"]["left"]
+        self.assertGreater(bad["sequence"], before["sequence"])
+        self.assertTrue(c["inputs_ready"])
+        self.assertEqual(c["input_error"], {"path": "/input/trigger/value", "code": 4})
+        self.assertTrue(c["inputs"]["/input/system/click"])
+        self.assertEqual(c["inputs"]["/input/trigger/value"], 0)
+        self.assertEqual(c["inputs"]["/input/grip/value"], 0)
+        self.assertEqual(self.runtime_inputs("left"), c["inputs"])
+        self.assertEqual(self.rpc("status")["controllers"]["left"], c)
+        good = self.rpc("controller-inputs left /input/trigger/value 0.5 /input/grip/value 1")
+        self.assertTrue(good["ok"])
+        self.assertIsNone(good["controllers"]["left"]["input_error"])
+        self.assertEqual(self.runtime_inputs("left"), good["controllers"]["left"]["inputs"])
+
+    def press_all_inputs(self):
+        self.connect_controllers()
+        for hand in ("left", "right"):
+            command = "controller-inputs " + hand + " " + " ".join(f"{path} 1" for path in expected_inputs(hand))
+            self.assertTrue(self.rpc(command)["ok"])
+
+    def test_frame_input_release_is_selective_without_releasing_pose(self):
+        self.press_all_inputs()
+        self.rpc("pose 4 5 6 1 0 0 0")
+        self.rpc("worn 1")
+        before = self.rpc("status")["controllers"]
+        for command in ("pose-release", "worn-release"):
+            self.assertEqual(self.rpc(command)["controllers"], before)
+        s = self.rpc("controller-input-release left")
+        self.assertTrue(s["ok"])
+        self.assertTrue(s["controllers"]["left"]["pose_override"])
+        self.assertEqual(s["controllers"]["left"]["pose"], before["left"]["pose"])
+        self.assertEqual(s["controllers"]["left"]["inputs"], expected_inputs("left"))
+        self.assertEqual(self.runtime_inputs("left"), expected_inputs("left"))
+        self.assertEqual(s["controllers"]["right"], before["right"])
+        for command in ("controller-input-release right", "controller-input-release all", "controller-input-release all"):
+            s = self.rpc(command)
+            self.assertTrue(s["ok"])
+            for hand in ("left", "right"):
+                self.assertTrue(s["controllers"][hand]["pose_override"])
+                self.assertEqual(self.runtime_inputs(hand), expected_inputs(hand))
+
+    def test_frame_inputs_neutralized_before_selective_and_global_disconnect(self):
+        self.press_all_inputs()
+        s = self.rpc("controller-release left")
+        self.assertTrue(s["ok"])
+        self.assertFalse(s["controllers"]["left"]["pose_override"])
+        self.assertEqual(self.runtime_inputs("left"), expected_inputs("left"))
+        self.assertTrue(all(self.runtime_inputs("right").values()))
+        self.assertEqual(self.runtime("inputs")["nonneutral_disconnects"], 0)
+        self.assertTrue(self.rpc("release")["ok"])
+        self.assertEqual(self.runtime_inputs("right"), expected_inputs("right"))
+        self.assertFalse(self.runtime("controllers")["controllers"][1]["connected"])
+        self.assertEqual(self.runtime("inputs")["nonneutral_disconnects"], 0)
+        self.assertFalse(self.rpc("controller-inputs right /input/a/click 1")["ok"])
+
+    def test_frame_inputs_release_failure_reports_state_and_allows_retry(self):
+        for command in ("controller-input-release left", "controller-release left", "release"):
+            with self.subTest(command=command):
+                self.press_all_inputs()
+                self.runtime("fail-input /input/trigger/value")
+                s = self.rpc(command)
+                self.assertFalse(s["ok"])
+                c = s["controllers"]["left"]
+                self.assertTrue(c["pose_override"])
+                self.assertIsNotNone(c["input_error"])
+                self.assertEqual(c["inputs"]["/input/trigger/value"], 1)
+                self.assertEqual(c["inputs"]["/input/system/click"], False)
+                self.assertEqual(self.runtime_inputs("left"), c["inputs"])
+                self.assertEqual(self.runtime("inputs")["nonneutral_disconnects"], 0)
+                self.assertTrue(self.rpc(command)["ok"])
+                self.assertEqual(self.runtime_inputs("left"), expected_inputs("left"))
+                self.assertEqual(self.runtime("inputs")["nonneutral_disconnects"], 0)
+
+    def test_frame_inputs_lifecycle_neutralizes_and_replaces_handles(self):
+        self.press_all_inputs()
+        old = self.runtime("inputs")["components"]
+        self.runtime("controller-deactivate-left")
+        s = self.rpc("status")["controllers"]["left"]
+        self.assertFalse(s["inputs_ready"])
+        self.assertEqual(s["inputs"], {})
+        after = self.runtime("inputs")
+        self.assertEqual(after["nonneutral_disconnects"], 0)
+        self.assertTrue(all(c["value"] == 0 for c in after["components"] if c["container"] == 120))
+        self.assertTrue(all(self.runtime_inputs("right").values()))
+        self.runtime("controller-activate")
+        new = self.runtime("inputs")["components"]
+        old_handles = {c["handle"] for c in old}
+        self.assertTrue(old_handles.isdisjoint(c["handle"] for c in new if c["live"]))
+        self.press_all_inputs()
+        self.runtime("cleanup")
+        self.assertTrue(all(c["value"] == 0 for c in self.runtime("inputs")["components"]))
+        self.assertEqual(self.runtime("inputs")["nonneutral_disconnects"], 0)
+        before = self.runtime("inputs")
+        time.sleep(0.03)
+        self.assertEqual(self.runtime("inputs"), before)
+        self.assertTrue(self.runtime("controller-late-activate")["rejected"])
 
     def test_controller_translation_rotation_and_ticks_without_hmd(self):
         for hand, xyz, q in [("left", [1, 2, 3], [0, 2, 0, 0]), ("right", [-4, 5, -6], [0, 0, 0, 3])]:
@@ -138,7 +369,7 @@ class InputProxyTests(unittest.TestCase):
         self.assertTrue(s["ok"], s)
         self.assertTrue(s["pose_override"])
         self.assertTrue(s["worn_override"])
-        self.assertEqual(s["controllers"]["left"], {"device_index": 20, "pose_override": False, "pose": None, "synthetic": True})
+        self.assertEqual(s["controllers"]["left"], {"device_index": 20, "pose_override": False, "pose": None, "synthetic": True, "inputs_ready": True, "inputs": expected_inputs("left"), "input_error": None})
         self.assertTrue(s["controllers"]["right"]["pose_override"])
         before = self.runtime("controllers")["controllers"]
         self.assertFalse(before[0]["connected"])
@@ -193,7 +424,7 @@ class InputProxyTests(unittest.TestCase):
         self.rpc("controller-pose right 4 5 6 1 0 0 0")
         self.runtime("controller-deactivate-left")
         s = self.rpc("status")
-        self.assertEqual(s["controllers"]["left"], {"device_index": None, "pose_override": False, "pose": None, "synthetic": True})
+        self.assertEqual(s["controllers"]["left"], {"device_index": None, "pose_override": False, "pose": None, "synthetic": True, "inputs_ready": False, "inputs": {}, "input_error": None})
         self.assertEqual(s["hmd_index"], 7)
         before = self.runtime("controllers")["controllers"]
         self.assertFalse(before[0]["sample_connected"])

@@ -1,5 +1,6 @@
 #pragma once
 #include "openvr_driver.h"
+#include "controller_inputs.hpp"
 #include <atomic>
 #include <array>
 #include <map>
@@ -23,20 +24,26 @@ class InputState {
     struct Controller {
         uint32_t index = vr::k_unTrackedDeviceIndexInvalid;
         std::optional<vr::DriverPose_t> requested;
+        ControllerInputs inputs;
+        bool inputs_ready = false;
+        std::string error_path;
+        vr::EVRInputError input_error = vr::VRInputError_None;
     };
     std::array<Controller, 2> controllers_{};
     struct Proximity { std::optional<bool> physical; double offset = 0; };
     std::map<vr::VRInputComponentHandle_t, Proximity> proximity_;
     std::optional<bool> worn_;
     uint64_t sequence_ = 0;
+    bool controller_update_locked(Controller &, const std::string &, ControllerInput &, float);
     void publish_locked();
-    void controller_release_locked(unsigned hand);
+    bool controller_input_release_locked(unsigned hand);
+    bool controller_release_locked(unsigned hand, bool force = false);
     std::string status_locked(bool ok, const char *error);
 public:
     void reset(vr::IVRServerDriverHost *, vr::IVRDriverInput *);
     void activate(uint32_t, vr::PropertyContainerHandle_t);
     void deactivate(uint32_t);
-    void controller_activate(unsigned hand, uint32_t index);
+    void controller_activate(unsigned hand, uint32_t index, ControllerInputs inputs);
     void controller_deactivate(unsigned hand);
     vr::DriverPose_t controller_pose(unsigned hand);
     void component(vr::PropertyContainerHandle_t, const char *, vr::VRInputComponentHandle_t);

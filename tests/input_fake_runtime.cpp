@@ -18,6 +18,62 @@ DriverPose_t synthetic_latest[2]{};
 unsigned synthetic_count[2]{};
 std::map<PropertyContainerHandle_t, std::map<ETrackedDeviceProperty, std::string>> strings;
 std::map<PropertyContainerHandle_t, int32_t> roles;
+struct Component {
+    PropertyContainerHandle_t container;
+    std::string path;
+    bool boolean;
+    EVRScalarType type;
+    EVRScalarUnits units;
+    double value = 0;
+    unsigned updates = 0;
+    bool live = true;
+};
+std::map<VRInputComponentHandle_t, Component> components;
+VRInputComponentHandle_t next_handle = 1000;
+std::string fail_path;
+unsigned failures_remaining = 0;
+unsigned nonneutral_disconnects = 0;
+void input_metrics() {
+    std::lock_guard<std::mutex> lock(mu);
+    std::cout << "{\"nonneutral_disconnects\":" << nonneutral_disconnects << ",\"components\":[";
+    bool first = true;
+    for (const auto &entry : components) {
+        const auto &c = entry.second;
+        if (!first) std::cout << ',';
+        first = false;
+        std::cout << "{\"handle\":" << entry.first << ",\"container\":" << c.container
+          << ",\"path\":\"" << c.path << "\",\"boolean\":" << c.boolean
+          << ",\"absolute\":" << (c.type == VRScalarType_Absolute)
+          << ",\"two_sided\":" << (c.units == VRScalarUnits_NormalizedTwoSided)
+          << ",\"value\":" << c.value << ",\"updates\":" << c.updates << ",\"live\":" << c.live << '}';
+    }
+    std::cout << "]}" << std::endl;
+}
+EVRInputError create_input(PropertyContainerHandle_t container, const char *path, VRInputComponentHandle_t *handle,
+                          bool boolean, EVRScalarType type, EVRScalarUnits units) {
+    std::lock_guard<std::mutex> lock(mu);
+    const char *fail = std::getenv("FAKE_CREATE_FAILURE");
+    if (fail && !strcmp(fail, path)) return VRInputError_InvalidParam;
+    *handle = ++next_handle;
+    if (std::getenv("FAKE_INVALID_HANDLE")) { *handle = k_ulInvalidInputComponentHandle; return VRInputError_None; }
+    components.emplace(*handle, Component{container, path, boolean, type, units});
+    return VRInputError_None;
+}
+EVRInputError update_input(VRInputComponentHandle_t handle, double value, bool boolean, double offset) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto &c = components.at(handle);
+    assert(c.live && c.boolean == boolean && offset == 0);
+    assert(std::isfinite(value));
+    assert(boolean ? (value == 0 || value == 1) :
+           (value <= 1 && value >= (c.units == VRScalarUnits_NormalizedTwoSided ? -1 : 0)));
+    if (fail_path == c.path && failures_remaining) { --failures_remaining; return VRInputError_InvalidParam; }
+    c.value = value; ++c.updates;
+    return VRInputError_None;
+}
+void retire_inputs(int hand) {
+    std::lock_guard<std::mutex> lock(mu);
+    for (auto &entry : components) if (entry.second.container == 120u + hand) entry.second.live = false;
+}
 bool raw_pose(const DriverPose_t &p) {
     bool raw = p.qWorldFromDriverRotation.w == 1 && p.qWorldFromDriverRotation.x == 0 &&
         p.qWorldFromDriverRotation.y == 0 && p.qWorldFromDriverRotation.z == 0 &&
@@ -45,6 +101,10 @@ void controller_metrics() {
           << ",\"sample_connected\":" << s.deviceIsConnected << ",\"sample_valid\":" << s.poseIsValid
           << ",\"sample_x\":" << s.vecPosition[0] << ",\"sample_qw\":" << s.qRotation.w
           << ",\"role\":" << roles[120 + k] << ",\"serial\":\"" << strings[120 + k][Prop_SerialNumber_String]
+          << "\",\"controller_type\":\"" << strings[120 + k][Prop_ControllerType_String]
+          << "\",\"input_profile\":\"" << strings[120 + k][Prop_InputProfilePath_String]
+          << "\",\"model\":\"" << strings[120 + k][Prop_ModelNumber_String]
+          << "\",\"manufacturer\":\"" << strings[120 + k][Prop_ManufacturerName_String]
           << "\",\"render_model\":\"" << strings[120 + k][Prop_RenderModelName_String] << "\"}";
     }
     std::cout << "]}" << std::endl;
@@ -78,6 +138,9 @@ public:
             auto sample = synthetic[i - 20]->GetPose();
             assert(sample.deviceIsConnected == p.deviceIsConnected && sample.vecPosition[0] == p.vecPosition[0]);
             std::lock_guard<std::mutex> lock(mu);
+            if (!p.deviceIsConnected) for (const auto &entry : components)
+                if (entry.second.container == 100u + i && entry.second.live && entry.second.value != 0)
+                    ++nonneutral_disconnects;
             synthetic_latest[i - 20] = p; ++synthetic_count[i - 20]; return;
         }
         std::lock_guard<std::mutex> lock(mu);
@@ -100,19 +163,21 @@ class Input : public IVRDriverInput {
     int prox_count = 0;
 public:
     EVRInputError CreateBooleanComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h) override {
+        if (c == 120 || c == 121) return create_input(c, n, h, true, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
         if (c == 107 && !strcmp(n,"/proximity")) *h = ++prox_count + 500;
         else if (c == 109 && !strcmp(n,"/proximity")) *h = 503;
         else { assert(c == 107 && !strcmp(n,"/input/button/click")); *h = 504; }
         return VRInputError_None;
     }
     EVRInputError UpdateBooleanComponent(VRInputComponentHandle_t h, bool v, double t) override {
+        if (h > 1000) return update_input(h, v, true, t);
         assert(h >= 501 && h <= 504); assert(t == -0.125 || t == 0);
         std::lock_guard<std::mutex> lock(mu);
         if (h == 501 || h == 502) { worn = v; ++worn_count; } else { other_worn = v; }
         return VRInputError_None;
     }
-    EVRInputError CreateScalarComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h, EVRScalarType t, EVRScalarUnits u) override { assert(c == 109 && !strcmp(n,"scalar") && t == VRScalarType_Absolute && u == VRScalarUnits_NormalizedOneSided); *h = 601; input_mask |= 1; return VRInputError_None; }
-    EVRInputError UpdateScalarComponent(VRInputComponentHandle_t h, float v, double t) override { assert(h == 601 && v == 0.5f && t == 0.125); input_mask |= 2; return VRInputError_InvalidParam; }
+    EVRInputError CreateScalarComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h, EVRScalarType t, EVRScalarUnits u) override { if (c == 120 || c == 121) return create_input(c, n, h, false, t, u); assert(c == 109 && !strcmp(n,"scalar") && t == VRScalarType_Absolute && u == VRScalarUnits_NormalizedOneSided); *h = 601; input_mask |= 1; return VRInputError_None; }
+    EVRInputError UpdateScalarComponent(VRInputComponentHandle_t h, float v, double t) override { if (h > 1000) return update_input(h, v, false, t); assert(h == 601 && v == 0.5f && t == 0.125); input_mask |= 2; return VRInputError_InvalidParam; }
     EVRInputError CreateHapticComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h) override { assert(c == 109 && !strcmp(n,"haptic")); *h = 602; input_mask |= 4; return VRInputError_None; }
     EVRInputError CreateSkeletonComponent(PropertyContainerHandle_t c, const char *n, const char *s, const char *b, EVRSkeletalTrackingLevel l, const VRBoneTransform_t *g, uint32_t count, VRInputComponentHandle_t *h) override { assert(c == 109 && !strcmp(n,"skeleton") && !strcmp(s,"path") && !strcmp(b,"base") && l == VRSkeletalTracking_Full && g && count == 1); *h = 603; input_mask |= 8; return VRInputError_None; }
     EVRInputError UpdateSkeletonComponent(VRInputComponentHandle_t h, EVRSkeletalMotionRange r, const VRBoneTransform_t *p, uint32_t n) override { assert(h == 603 && r == VRSkeletalMotionRange_WithController && p && n == 1); input_mask |= 16; return VRInputError_InvalidParam; }
@@ -200,9 +265,18 @@ int main(int argc, char **) {
         else if (cmd == "deactivate") { hmd->Deactivate(); std::cout << "{\"deactivated\":" << ((lifecycle() & 2) != 0) << "}" << std::endl; }
         else if (cmd == "metrics") metrics();
         else if (cmd == "controllers") controller_metrics();
-        else if (cmd == "controller-deactivate-left") { assert(synthetic[0]); synthetic[0]->Deactivate(); controller_metrics(); }
+        else if (cmd == "inputs") input_metrics();
+        else if (cmd.rfind("fail-input ", 0) == 0) {
+            std::lock_guard<std::mutex> lock(mu);
+            fail_path = cmd.substr(11); failures_remaining = 1;
+            std::cout << "{\"ok\":true}" << std::endl;
+        }
+        else if (cmd == "controller-deactivate-left") { assert(synthetic[0]); synthetic[0]->Deactivate(); retire_inputs(0); controller_metrics(); }
         else if (cmd == "controller-activate") {
-            for (int k = 0; k < 2; ++k) if (synthetic[k]) assert(synthetic[k]->Activate(20 + k) == VRInitError_None);
+            for (int k = 0; k < 2; ++k) if (synthetic[k]) {
+                synthetic[k]->Deactivate(); retire_inputs(k);
+                assert(synthetic[k]->Activate(20 + k) == VRInitError_None);
+            }
             controller_metrics();
         }
         else if (cmd == "controller-late-activate") {

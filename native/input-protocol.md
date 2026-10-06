@@ -71,6 +71,8 @@ status
 pose x y z qw qx qy qz
 controller-pose left|right x y z qw qx qy qz
 controller-release left|right|all
+controller-inputs left|right /input/path value [/input/path value ...]
+controller-input-release left|right|all
 worn 0
 worn 1
 release
@@ -94,7 +96,11 @@ nominal 90Hz even without physical updates or provider RunFrame calls.
 
 release clears HMD pose, worn, and both synthetic controller overrides.
 pose-release and worn-release clear only their named HMD channel.
-controller-release clears one hand or both with all, without releasing HMD channels.
+controller-release neutralizes inputs and disconnects one hand or both with all,
+without releasing HMD channels. controller-input-release neutralizes inputs only,
+keeping controller poses connected. A failed neutralization returns ok:false and
+keeps that hand connected so the caller can retry. Other hands and HMD channels
+still release when global release encounters such a failure.
 Releasing an HMD channel immediately forwards its latest cached physical sample,
 including original driver transforms and validity. If no physical sample has arrived yet,
 that channel resumes forwarding at the next physical update. No physical state is
@@ -108,10 +114,69 @@ clears their readiness, then calls real provider Cleanup.
 
 The provider registers frame_testbench_left and frame_testbench_right as separate
 TrackedDeviceClass_Controller devices. Each has its explicit left/right role hint
-and the built-in generic_controller render model. They never wrap a physical
-controller or depend on one waking up. No buttons, haptics, or physical-controller
-input profile are advertised. These are pose-only devices; action-based input
-bindings and application-specific rendering need separate live verification.
+and the built-in generic_controller render model. They advertise controller type
+frame_controller, model Steam Frame Controller, manufacturer Valve and input profile
+{frame_controller}/input/frame_controller_profile.json. That resource must already
+exist in the installed runtime. This repository does not distribute Valve's private
+profile, bindings, icons or models. The generic render model remains until exact
+side-specific resource names and rendering can be verified on a live runtime.
+These devices never wrap a physical controller or depend on one waking up.
+Action bindings and application-specific rendering need separate live verification.
+Skeleton and haptic components are not registered or emulated.
+
+Each hand registers 25 input components, 21 booleans and 4 absolute normalized scalars:
+
+| Side | Paths | Type/range |
+| --- | --- | --- |
+| Both | /input/system/click, /input/system/touch | boolean |
+| Both | /input/bumper/click, /input/bumper/touch | boolean |
+| Both | /input/trigger/click, /input/trigger/touch | boolean |
+| Both | /input/grip/click, /input/grip/touch | boolean |
+| Both | /input/thumbstick/click, /input/thumbstick/touch | boolean |
+| Both | /input/thumbrest/touch | boolean, no thumbrest click |
+| Both | /input/trigger/value, /input/grip/value | scalar [0,1], NormalizedOneSided |
+| Both | /input/thumbstick/x, /input/thumbstick/y | scalar [-1,1], NormalizedTwoSided |
+| Left | /input/view/click, /input/view/touch | boolean |
+| Left | /input/dpad_up/click, /input/dpad_up/touch | boolean |
+| Left | /input/dpad_right/click, /input/dpad_right/touch | boolean |
+| Left | /input/dpad_down/click, /input/dpad_down/touch | boolean |
+| Left | /input/dpad_left/click, /input/dpad_left/touch | boolean |
+| Right | /input/menu/click, /input/menu/touch | boolean |
+| Right | /input/a/click, /input/a/touch | boolean |
+| Right | /input/b/click, /input/b/touch | boolean |
+| Right | /input/x/click, /input/x/touch | boolean |
+| Right | /input/y/click, /input/y/touch | boolean |
+
+controller-inputs requires successful input registration and initialization plus
+an active controller-pose override for that side. At least one path/value pair is
+required. Boolean tokens must be exactly 0 or 1. Scalars must be finite and in
+range before conversion to float. Unknown or wrong-side paths, duplicate paths,
+extra tokens, missing values and invalid values reject the entire batch without
+changing state, sequence or any runtime component. Touch/click/value channels are
+independent; trigger value does not synthesize a click or touch.
+
+Validation is atomic, but OpenVR writes are not transactional. After validation,
+components publish in caller order at time offset zero. A rejected SDK write stops
+the batch, returns ok:false and records input_error with the rejected path and SDK
+code. Earlier successful writes remain applied, later writes are not attempted,
+and sequence advances. There is no rollback claim. inputs contains only the last
+successfully published values, using JSON booleans and the actual SDK float values.
+Read status, then retry or use controller-input-release to recover. SDK acceptance
+is not an application action-state readback. Inputs stay latched until changed or
+released, without synthetic periodic re-publication.
+
+Release attempts every registered component even if some writes fail. Successful
+neutralizations update inputs; failures retain the last confirmed value. Explicit
+release returns ok:false on any rejected write. Runtime Deactivate cannot be
+refused: it attempts neutralization before disconnecting, logs SDK failures, and
+invalidates all handles regardless. A deactivated side retains its last error in
+status but has inputs:{} and inputs_ready:false. Cleanup attempts release before
+deactivation and logs any remaining forced-release failures. No calls use old
+handles after deactivation; reactivation registers a fresh set.
+
+Registration failures leave controller pose control available but inputs_ready
+false. Only successfully initialized components appear in inputs. Reactivation
+is required to retry failed registration or initialization.
 
 Registration runs outside the state lock because the runtime can synchronously
 call Activate and GetPose. The devices live for the provider's lifetime. Failed
@@ -126,8 +191,8 @@ quaternion rules as the HMD pose command. Each hand persists independently and
 publishes immediately and at the nominal 90Hz tick, even when the physical HMD
 is invalid, inactive, or not producing updates. GetPose returns the selected pose.
 
-controller-release clears the selected request and immediately publishes the
-explicit disconnected pose. It then stops ticking that hand; status pose becomes
+controller-release first neutralizes the selected inputs. On success it clears
+the selected pose request and immediately publishes the explicit disconnected pose. It then stops ticking that hand; status pose becomes
 null while device_index remains assigned. Release of an inactive or already
 released hand is accepted. Runtime Deactivate clears that hand's request and
 index and stops publication, without changing the other hand or HMD. Unlike HMD
@@ -167,6 +232,15 @@ Every response, including rejected commands, contains:
   * pose_override: boolean, true when this hand has a requested pose.
   * pose: requested pose in the same shape as the HMD pose field, or null when released.
   * synthetic: always true. These are not captured physical controllers.
+  * inputs_ready: true after every component registers and its initial neutral
+    update succeeds. False before activation, after deactivation or on partial
+    registration/initialization failure. Later update errors do not clear readiness.
+  * inputs: exact component path to boolean/number map of confirmed SDK writes.
+    Empty before activation/after deactivation. Missing paths indicate components
+    without a successful initialization, never invented neutral values.
+  * input_error: null or {path:string, code:integer}, the last registration,
+    initialization or publication failure. A successful input batch or release on
+    a ready controller clears this error; malformed requests and status do not.
 * error: fixed explanatory string on rejected requests.
 
 Pose and worn commands reject missing HMD/proximity readiness. On Deactivate the
