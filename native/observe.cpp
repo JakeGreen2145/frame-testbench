@@ -82,44 +82,78 @@ bool pause_setting(vr::IVRSettings *settings) {
     return value;
 }
 
-std::string status(Sdk &sdk) {
-    auto *system = sdk.get<vr::IVRSystem>(vr::IVRSystem_Version);
-    auto *compositor = sdk.get<vr::IVRCompositor>(vr::IVRCompositor_Version);
-    auto *settings = sdk.get<vr::IVRSettings>(vr::IVRSettings_Version);
+using PoseSnapshot = std::array<std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount>, 3>;
+const vr::ETrackingUniverseOrigin origins[] = {vr::TrackingUniverseStanding,
+    vr::TrackingUniverseRawAndUncalibrated, vr::TrackingUniverseSeated};
+const char *origin_names[] = {"standing", "raw", "seated"};
+
+std::string device_status(vr::IVRSystem *system, vr::TrackedDeviceIndex_t index,
+                          const PoseSnapshot &poses, bool controller) {
     struct Property { const char *name; vr::ETrackedDeviceProperty key; };
     const Property properties[] = {{"driver", vr::Prop_TrackingSystemName_String},
         {"model", vr::Prop_ModelNumber_String}, {"serial", vr::Prop_SerialNumber_String}};
     std::ostringstream out, errors;
-    out << "{\"ok\":true,\"command\":\"status\",\"hmd\":{\"device_index\":0";
+    std::string serial;
+    out << "{\"device_index\":" << index;
     errors << '{';
     for (size_t i = 0; i < 3; ++i) {
         const auto &property = properties[i];
         std::array<char, vr::k_unMaxPropertyStringSize> value{};
         vr::ETrackedPropertyError error = vr::TrackedProp_Success;
-        const auto count = system->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
+        const auto count = system->GetStringTrackedDeviceProperty(index,
             property.key, value.data(), value.size(), &error);
         if (error == vr::TrackedProp_Success && (count == 0 || count > value.size() || value[count - 1] != '\0'))
             error = vr::TrackedProp_BufferTooSmall;
         out << ',' << quote(property.name) << ':';
-        if (error == vr::TrackedProp_Success) out << quote(std::string(value.data(), count - 1));
-        else out << "null";
+        if (error == vr::TrackedProp_Success) {
+            const std::string text(value.data(), count - 1);
+            out << quote(text);
+            if (property.key == vr::Prop_SerialNumber_String) serial = text;
+        } else out << "null";
         if (i) errors << ',';
         errors << quote(property.name) << ':' << error;
     }
     errors << '}';
-    out << ",\"property_errors\":" << errors.str()
-        << ",\"activity_level\":" << system->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd)
-        << ",\"poses\":{";
-    const vr::ETrackingUniverseOrigin origins[] = {vr::TrackingUniverseStanding,
-        vr::TrackingUniverseRawAndUncalibrated, vr::TrackingUniverseSeated};
-    const char *names[] = {"standing", "raw", "seated"};
-    for (int i = 0; i < 3; ++i) {
-        vr::TrackedDevicePose_t p{};
-        system->GetDeviceToAbsoluteTrackingPose(origins[i], 0, &p, 1);
-        if (i) out << ',';
-        out << quote(names[i]) << ':' << pose(p);
+    out << ",\"property_errors\":" << errors.str();
+    if (controller) {
+        // Roles, model names and drivers can also belong to physical devices.
+        // Only these exact serials identify our synthetic pose-only controllers.
+        out << ",\"role\":" << system->GetControllerRoleForTrackedDeviceIndex(index)
+            << ",\"synthetic\":" << boolean(serial == "frame_testbench_left" || serial == "frame_testbench_right");
+    } else {
+        out << ",\"activity_level\":" << system->GetTrackedDeviceActivityLevel(index);
     }
-    out << "}},\"transforms\":{\"raw_to_standing\":"
+    out << ",\"poses\":{";
+    for (size_t i = 0; i < poses.size(); ++i) {
+        if (i) out << ',';
+        out << quote(origin_names[i]) << ':' << pose(poses[i][index]);
+    }
+    out << "}}";
+    return out.str();
+}
+
+std::string status(Sdk &sdk) {
+    auto *system = sdk.get<vr::IVRSystem>(vr::IVRSystem_Version);
+    auto *compositor = sdk.get<vr::IVRCompositor>(vr::IVRCompositor_Version);
+    auto *settings = sdk.get<vr::IVRSettings>(vr::IVRSettings_Version);
+    // OpenVR fills arrays indexed by the actual device index, not controller
+    // role or position in an enumeration. Share one read per origin across all devices.
+    PoseSnapshot poses{};
+    for (size_t i = 0; i < poses.size(); ++i)
+        system->GetDeviceToAbsoluteTrackingPose(origins[i], 0, poses[i].data(), poses[i].size());
+    std::ostringstream out;
+    out << "{\"ok\":true,\"command\":\"status\",\"hmd\":"
+        << device_status(system, vr::k_unTrackedDeviceIndex_Hmd, poses, false)
+        << ",\"controllers\":[";
+    bool first = true;
+    for (vr::TrackedDeviceIndex_t index = 0; index < vr::k_unMaxTrackedDeviceCount; ++index) {
+        // Keep class-known disconnected devices visible for release readback.
+        if (system->GetTrackedDeviceClass(index) != vr::TrackedDeviceClass_Controller) continue;
+        if (!first) out << ',';
+        first = false;
+        out << device_status(system, index, poses, true);
+    }
+    out << "],\"transforms\":{\"raw_to_standing\":"
         << matrix(system->GetRawZeroPoseToStandingAbsoluteTrackingPose())
         << ",\"seated_to_standing\":" << matrix(system->GetSeatedZeroPoseToStandingAbsoluteTrackingPose()) << '}';
     vr::Compositor_FrameTiming current{}, previous{};

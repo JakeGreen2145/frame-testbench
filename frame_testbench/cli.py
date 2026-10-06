@@ -74,18 +74,22 @@ def parser():
     compositor.add_argument('mode', choices=('awake', 'auto'))
     worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
     worn.add_argument('state', choices=('on', 'off', 'physical'))
-    p = commands.add_parser('pose', help='override the actual HMD pose')
-    poses = p.add_subparsers(dest='pose_command', required=True)
-    absolute = poses.add_parser('set')
-    absolute.add_argument('--position', type=float, nargs=3, required=True, metavar=('X', 'Y', 'Z'))
-    absolute.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
-    absolute.add_argument('--space', choices=('standing', 'raw'), default='standing')
-    relative = poses.add_parser('move')
-    relative.add_argument('--translation', type=float, nargs=3, default=[0, 0, 0], metavar=('X', 'Y', 'Z'))
-    relative.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
-    relative.add_argument('--space', choices=('standing', 'raw'), default='standing')
-    poses.add_parser('reset', help='restore physical pose while retaining worn override')
-    commands.add_parser('release', help='restore physical pose and proximity')
+    hmd = commands.add_parser('pose', help='override the actual HMD pose')
+    controller = commands.add_parser('controller', help='drive synthetic pose-only controllers')
+    controller.add_argument('side', choices=('left', 'right'))
+    for p, reset_help in ((hmd, 'restore physical pose while retaining worn override'),
+                          (controller, 'disconnect the selected synthetic controller')):
+        poses = p.add_subparsers(dest='pose_command', required=True)
+        absolute = poses.add_parser('set')
+        absolute.add_argument('--position', type=float, nargs=3, required=True, metavar=('X', 'Y', 'Z'))
+        absolute.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
+        absolute.add_argument('--space', choices=('standing', 'raw'), default='standing')
+        relative = poses.add_parser('move')
+        relative.add_argument('--translation', type=float, nargs=3, default=[0, 0, 0], metavar=('X', 'Y', 'Z'))
+        relative.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
+        relative.add_argument('--space', choices=('standing', 'raw'), default='standing')
+        poses.add_parser('reset', help=reset_help)
+    commands.add_parser('release', help='restore physical HMD pose/proximity and disconnect synthetic controllers')
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
     capture.add_argument('--fetch', help='with --host, download PNGs into this new local directory')
@@ -110,16 +114,20 @@ def dispatch(args, bench):
         return bench.control({'on': 'worn 1', 'off': 'worn 0', 'physical': 'worn-release'}[args.state])
     if args.command == 'release':
         return bench.control('release')
-    if args.command == 'pose':
+    if args.command in ('pose', 'controller'):
+        controller = args.command == 'controller'
+        target = 'controller ' + args.side if controller else 'pose'
         if args.pose_command == 'reset':
-            return bench.control('pose-release')
+            return bench.control('controller-release ' + args.side if controller else 'pose-release')
         if args.pose_command == 'set':
             desired = pose.from_euler(args.position, args.rotation)
         else:
             pose.from_euler(args.translation, args.rotation)  # validate before I/O
             state = bench.control('status')
+            if controller:
+                state = state['controllers'][args.side]
             if not state['pose_override']:
-                raise ValueError('pose move requires pose set first')
+                raise ValueError(f'{target} move requires {target} set first')
             desired = state['pose']
         transform = None
         if args.space == 'standing':
@@ -132,7 +140,8 @@ def dispatch(args, bench):
         if transform:
             desired = pose.compose(pose.inverse(transform), desired)
         values = desired['position'] + desired['quaternion']
-        return bench.control('pose ' + ' '.join(format(v, '.17g') for v in values))
+        command = 'controller-pose ' + args.side if controller else 'pose'
+        return bench.control(command + ' ' + ' '.join(format(v, '.17g') for v in values))
     if args.command == 'capture':
         return bench.capture(args.output)
     if args.command in ('install', 'uninstall'):

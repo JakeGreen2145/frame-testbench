@@ -29,16 +29,41 @@ def fake_source():
     # Derive actual vtable signatures, never guessed ABI layouts. Every method
     # outside the explicit read/capture/settings/debug contract aborts.
     overrides = {
-        'GetDeviceToAbsoluteTrackingPose': '''if(fPredictedSecondsToPhotonsFromNow != 0 || unTrackedDevicePoseArrayCount != 1) abort();
-            auto &p=pTrackedDevicePoseArray[0]; p={}; p.bDeviceIsConnected=true;
-            p.bPoseIsValid=!mode("invalid_pose"); p.eTrackingResult=TrackingResult_Running_OK;
-            p.mDeviceToAbsoluteTracking=matrix(float(eOrigin)); p.vVelocity.v[0]=0.25f;''',
+        'GetDeviceToAbsoluteTrackingPose': '''if(fPredictedSecondsToPhotonsFromNow != 0 ||
+                (unTrackedDevicePoseArrayCount != 1 && unTrackedDevicePoseArrayCount != k_unMaxTrackedDeviceCount)) abort();
+            log(("poses " + std::to_string(eOrigin) + " " + std::to_string(unTrackedDevicePoseArrayCount)).c_str());
+            for(uint32_t i=0; i<unTrackedDevicePoseArrayCount; ++i){
+                auto &p=pTrackedDevicePoseArray[i]; p={}; p.bDeviceIsConnected=i==0 || i==2 || i==4;
+                p.bPoseIsValid=p.bDeviceIsConnected && !mode("invalid_pose");
+                p.eTrackingResult=p.bPoseIsValid?TrackingResult_Running_OK:TrackingResult_Uninitialized;
+                p.mDeviceToAbsoluteTracking=matrix(float(eOrigin) + 100*float(i));
+                p.vVelocity.v[0]=0.25f+float(i); p.vAngularVelocity.v[2]=float(i);
+            }''',
+        'GetTrackedDeviceClass': '''if(unDeviceIndex>=k_unMaxTrackedDeviceCount) abort();
+            if(unDeviceIndex==0) return TrackedDeviceClass_HMD;
+            if(mode("no_controllers")) return TrackedDeviceClass_Invalid;
+            if(unDeviceIndex==2 || unDeviceIndex==4 || unDeviceIndex==7 || unDeviceIndex==63)
+                return TrackedDeviceClass_Controller;
+            return unDeviceIndex==8?TrackedDeviceClass_GenericTracker:TrackedDeviceClass_Invalid;''',
+        'GetControllerRoleForTrackedDeviceIndex': '''switch(unDeviceIndex){
+            case 2: case 4: return TrackedControllerRole_LeftHand;
+            case 7: return TrackedControllerRole_RightHand;
+            case 63: return TrackedControllerRole_OptOut;
+            default: abort();}''',
         'GetSeatedZeroPoseToStandingAbsoluteTrackingPose': 'return matrix(10);',
         'GetRawZeroPoseToStandingAbsoluteTrackingPose': 'return matrix(20);',
         'GetTrackedDeviceActivityLevel': 'return k_EDeviceActivityLevel_UserInteraction;',
         'GetStringTrackedDeviceProperty': '''if(pError) *pError=TrackedProp_Success;
             const char *s=prop==Prop_ModelNumber_String?"Fake \\\"HMD\\\"":prop==Prop_SerialNumber_String?"TEST-001":"fake_driver";
-            if(mode("property_error")){if(pError) *pError=TrackedProp_UnknownProperty; return 0;}
+            if(unDeviceIndex!=0){
+                if(unDeviceIndex!=2 && unDeviceIndex!=4 && unDeviceIndex!=7 && unDeviceIndex!=63) abort();
+                s=prop==Prop_ModelNumber_String?"Pose controller":prop==Prop_SerialNumber_String?
+                    (unDeviceIndex==4?"frame_testbench_left":unDeviceIndex==7?"frame_testbench_right":
+                     unDeviceIndex==2?"PHYSICAL-002":"frame_testbench_left_extra"):"frame_testbench";
+            }
+            if(mode("property_error") || (mode("controller_property_error") && unDeviceIndex==7)){
+                if(pError) *pError=TrackedProp_UnknownProperty; return 0;
+            }
             uint32_t n=uint32_t(strlen(s)+1); if(unBufferSize<n){if(pError) *pError=TrackedProp_BufferTooSmall; return n;}
             memcpy(pchValue,s,n); return n;''',
         'GetTimeSinceLastVsync': '*pfSecondsSinceLastVsync=0.01f; *pulFrameCounter=12345; return true;',
@@ -206,6 +231,56 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(self.calls().count('init_background'), 1)
         self.assertEqual(self.calls()[-1], 'shutdown')
         self.assertFalse(any(x.startswith('set_') for x in self.calls()))
+
+    def test_controllers_include_disconnected_devices_and_exact_index_poses(self):
+        d = self.run_observe('status')
+        self.assertIn('controllers', d)
+        controllers = d['controllers']
+        self.assertEqual([c['device_index'] for c in controllers], [2, 4, 7, 63])
+        self.assertEqual([c['role'] for c in controllers], [1, 1, 2, 3])
+        self.assertEqual([c['serial'] for c in controllers],
+                         ['PHYSICAL-002', 'frame_testbench_left', 'frame_testbench_right',
+                          'frame_testbench_left_extra'])
+        self.assertEqual([c['synthetic'] for c in controllers], [False, True, True, False])
+        for controller in controllers:
+            index = controller['device_index']
+            self.assertEqual(controller['driver'], 'frame_testbench')
+            self.assertEqual(controller['model'], 'Pose controller')
+            self.assertEqual(controller['property_errors'], {'driver': 0, 'model': 0, 'serial': 0})
+            self.assertEqual(set(controller['poses']), {'standing', 'raw', 'seated'})
+            for space, origin in [('standing', 1), ('raw', 2), ('seated', 0)]:
+                p = controller['poses'][space]
+                self.assertEqual(p['connected'], index in (2, 4))
+                self.assertEqual(p['valid'], index in (2, 4))
+                self.assertEqual(p['tracking_result'], 200 if index in (2, 4) else 1)
+                self.assertEqual(p['matrix'], [[1, 0, 0, index * 100 + origin],
+                                              [0, 1, 0, 0], [0, 0, 1, 0]])
+                self.assertEqual(p['velocity'], [index + .25, 0, 0])
+                self.assertEqual(p['angular_velocity'], [0, 0, index])
+        # The array is indexed by device, not compacted by class or role. Read
+        # each full origin array once and share it with the HMD snapshot.
+        self.assertEqual([c for c in self.calls() if c.startswith('poses ')],
+                         ['poses 1 64', 'poses 2 64', 'poses 0 64'])
+        self.assertFalse(any(c.startswith('set_') for c in self.calls()))
+
+    def test_controller_property_errors_do_not_hide_device_or_claim_synthetic(self):
+        d = self.run_observe('status', mode='controller_property_error')
+        self.assertIn('controllers', d)
+        controllers = {c['device_index']: c for c in d['controllers']}
+        self.assertEqual(set(controllers), {2, 4, 7, 63})
+        for name in ('driver', 'model', 'serial'):
+            self.assertIsNone(controllers[7][name])
+            self.assertNotEqual(controllers[7]['property_errors'][name], 0)
+            self.assertEqual(controllers[4]['property_errors'][name], 0)
+        self.assertFalse(controllers[7]['synthetic'])
+        self.assertTrue(controllers[4]['synthetic'])
+        self.assertFalse(controllers[7]['poses']['standing']['connected'])
+
+    def test_no_controllers_returns_empty_list(self):
+        d = self.run_observe('status', mode='no_controllers')
+        self.assertIn('controllers', d)
+        self.assertEqual(d['controllers'], [])
+        self.assertTrue(d['hmd']['poses']['standing']['valid'])
 
     def test_invalid_pose_is_not_claimed_valid(self):
         d = self.run_observe('status', mode='invalid_pose')
