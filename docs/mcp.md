@@ -91,7 +91,14 @@ An editable install makes the module available regardless of working directory.
 | `hmd_pose_reset` | None | `pose reset` |
 | `controller_pose_set` | Required `side`, `position`; optional `rotation`, `space` | `controller SIDE set` |
 | `controller_pose_move` | Required `side`; optional `translation`, `rotation`, `space` | `controller SIDE move` |
-| `controller_pose_reset` | Required `side` | `controller SIDE reset` |
+| `controller_pose_reset` | Required `side` | `controller SIDE reset`, clears inputs and disconnects |
+| `controller_button` | `side`, `button`, `pressed`; optional `touched` | `controller SIDE button NAME on/off [--touch on/off]` |
+| `controller_trigger` | `side`, `value`; optional `clicked`, `touched` | `controller SIDE trigger VALUE [--click on/off] [--touch on/off]` |
+| `controller_grip` | `side`, `value`; optional `clicked`, `touched` | `controller SIDE grip VALUE [--click on/off] [--touch on/off]` |
+| `controller_thumbstick` | `side`, `x`, `y`; optional `clicked`, `touched` | `controller SIDE thumbstick X Y [--click on/off] [--touch on/off]` |
+| `controller_touch` | `side`, `control`, `touched` | `controller SIDE touch NAME on/off` |
+| `controller_inputs_reset` | `side` | `controller SIDE inputs-reset`, retains pose |
+| `controller_input_status` | None | `inputs`, independent SteamVR action readback |
 | `compositor` | `mode`: `awake` or `auto` | `compositor MODE` |
 | `capture` | None | `capture` with a server-owned output/fetch directory |
 | `release_all` | None | `release` |
@@ -101,6 +108,60 @@ arrays in meters. Rotation is `[yaw, pitch, roll]` in degrees. All numbers must
 be finite JSON numbers, not strings or booleans. Default translation and rotation
 are `[0, 0, 0]`. Space is `standing` by default, or `raw`. Moves require a prior
 pose set for that device and follow the existing CLI's coordinate conventions.
+
+### Controller inputs
+
+Set the selected controller's pose before sending buttons, analog values or touches.
+The native proxy enforces this prerequisite. Each input tool sends a single batch;
+invalid fields reject the whole batch before it changes controller state. CLI and
+MCP also reject wrong-sided names and invalid values before any backend I/O,
+including SSH or a CLI subprocess.
+
+Button names match the Frame profile:
+
+- Both sides: `system`, `bumper`, `trigger`, `grip`, `thumbstick`.
+- Right only: `menu`, `a`, `b`, `x`, `y`.
+- Left only: `view`, `dpad_up`, `dpad_right`, `dpad_down`, `dpad_left`.
+
+`controller_touch` accepts those names plus `thumbrest` on either side. Thumbrest
+has touch only, no click. Wrong-sided names are errors, not aliases. Skeletons and
+haptics are not supported.
+
+Trigger and grip `value` must be in `[0, 1]`. Thumbstick `x` and `y` must each be
+in `[-1, 1]`. MCP `pressed`, `clicked` and `touched` are JSON booleans. Numeric
+strings, boolean analog values, nonfinite numbers and out-of-range values are errors.
+
+Values, clicks and touches are independent. No value threshold infers a click or
+touch. Omitted optional fields remain unchanged; optional JSON `null` also leaves
+them unchanged. Setting trigger value to zero does not release a previously set
+trigger click. Use `controller_inputs_reset` to neutralize all buttons, analog axes
+and touches on that side without disconnecting or moving its controller.
+`controller_pose_reset` clears that side's inputs and disconnects it. `release_all`
+clears both controllers' inputs and disconnects them as well as releasing HMD overrides.
+
+`status` includes the proxy's per-side `inputs_ready` and commanded `inputs` map.
+That acknowledgement is not downstream verification. Use `controller_input_status`
+for the observer's independent SteamVR action readback. The CLI equivalent is
+`frame-testbench inputs`; it uses the checkout's `resources/input-actions.json`
+manifest and does not query the control socket. The native observer and action
+resources must be installed in the target checkout. Readback establishes the
+observer's action values, not another application's bindings or behavior.
+
+Example calls to `controller_trigger`, `controller_button`, then `controller_touch`:
+
+```json
+{"side": "right", "value": 0.75, "clicked": true, "touched": true}
+```
+
+```json
+{"side": "right", "button": "a", "pressed": true}
+```
+
+```json
+{"side": "left", "control": "thumbrest", "touched": false}
+```
+
+### Pose examples
 
 Examples of tool arguments:
 
@@ -114,8 +175,8 @@ Examples of tool arguments:
 
 Input overrides persist until explicitly reset or released. Disconnecting the
 MCP client does not release them. `release_all` restores physical HMD tracking
-and proximity and disconnects the synthetic controllers, but leaves the compositor
-policy unchanged. Physical controller tracking is never overridden. Use
+and proximity, clears controller inputs and disconnects the synthetic controllers.
+It leaves the compositor policy unchanged. Physical controller tracking is never overridden. Use
 `compositor` with `{"mode":"auto"}` separately to restore automatic standby.
 Do not apply virtual tracking overrides while someone relies on normal tracking.
 

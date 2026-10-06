@@ -38,6 +38,9 @@ print('fixture observer diagnostic', file=sys.stderr)
 command = sys.argv[1]
 if command == 'status':
     print(json.dumps({{'ok': True, 'frame_index': 42}}))
+elif command == 'inputs':
+    assert sys.argv[2].endswith('/resources/input-actions.json')
+    print(json.dumps({{'ok': True, 'fixture_input_readback': True}}))
 elif command == 'capture':
     out = Path(sys.argv[2])
     out.mkdir()
@@ -67,7 +70,15 @@ else:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, 'frame-testbench')
                     tools = await client.list_tools()
-                    self.assertEqual(len(tools.tools), 11)
+                    self.assertEqual(len(tools.tools), 18)
+                    inputs = await client.call_tool('controller_input_status', {})
+                    self.assertFalse(inputs.isError, inputs)
+                    self.assertTrue(inputs.structuredContent['fixture_input_readback'])
+                    invalid_input = await client.call_tool('controller_trigger', {'side': 'left', 'value': True})
+                    self.assertTrue(invalid_input.isError)
+                    failed_input = await client.call_tool('controller_button', {'side': 'right', 'button': 'a', 'pressed': True})
+                    self.assertTrue(failed_input.isError)
+                    self.assertNotIn('unknown tool', failed_input.content[0].text)
                     status = await client.call_tool('status', {})
                     self.assertFalse(status.isError, status)
                     self.assertEqual(status.structuredContent['runtime']['frame_index'], 42)

@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
-from . import install, pose, transport
+from . import controller_inputs, install, pose, transport
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,15 +70,16 @@ def parser():
     ap.add_argument('--socket', help='override local input control socket')
     commands = ap.add_subparsers(dest='command', required=True)
     commands.add_parser('status', help='runtime poses, frames and input override readback')
+    commands.add_parser('inputs', help='independent SteamVR controller action readback')
     compositor = commands.add_parser('compositor', help='persistently control compositor standby policy')
     compositor.add_argument('mode', choices=('awake', 'auto'))
     worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
     worn.add_argument('state', choices=('on', 'off', 'physical'))
     hmd = commands.add_parser('pose', help='override the actual HMD pose')
-    controller = commands.add_parser('controller', help='drive synthetic pose-only controllers')
+    controller = commands.add_parser('controller', help='drive synthetic controller poses and inputs')
     controller.add_argument('side', choices=('left', 'right'))
     for p, reset_help in ((hmd, 'restore physical pose while retaining worn override'),
-                          (controller, 'disconnect the selected synthetic controller')):
+                          (controller, 'clear inputs and disconnect the selected synthetic controller')):
         poses = p.add_subparsers(dest='pose_command', required=True)
         absolute = poses.add_parser('set')
         absolute.add_argument('--position', type=float, nargs=3, required=True, metavar=('X', 'Y', 'Z'))
@@ -89,6 +90,21 @@ def parser():
         relative.add_argument('--rotation', type=float, nargs=3, default=[0, 0, 0], metavar=('YAW', 'PITCH', 'ROLL'))
         relative.add_argument('--space', choices=('standing', 'raw'), default='standing')
         poses.add_parser('reset', help=reset_help)
+    for name in ('button', 'touch', 'trigger', 'grip', 'thumbstick'):
+        inputs = poses.add_parser(name, help='update inputs; requires controller set first')
+        if name in ('button', 'touch'):
+            inputs.add_argument('control')
+            inputs.add_argument('state', choices=('on', 'off'))
+        elif name == 'thumbstick':
+            inputs.add_argument('x', type=float)
+            inputs.add_argument('y', type=float)
+        else:
+            inputs.add_argument('value', type=float)
+        if name in ('trigger', 'grip', 'thumbstick'):
+            inputs.add_argument('--click', choices=('on', 'off'))
+        if name != 'touch':
+            inputs.add_argument('--touch', choices=('on', 'off'))
+    poses.add_parser('inputs-reset', help='neutralize inputs, retaining the controller pose')
     commands.add_parser('release', help='restore physical HMD pose/proximity and disconnect synthetic controllers')
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
@@ -100,6 +116,11 @@ def parser():
 
 
 def dispatch(args, bench):
+    input_command = controller_inputs.command(args)
+    if input_command is not None:
+        return bench.control(input_command)
+    if args.command == 'inputs':
+        return bench.native('inputs', str(ROOT / 'resources/input-actions.json'))
     if args.command == 'status':
         runtime = bench.native('status')
         try:
@@ -158,6 +179,7 @@ def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(arguments)
     try:
+        controller_inputs.command(args)  # validate inputs before local or SSH I/O
         if args.host:
             # Remove only the transport options; preserve arguments and literal values.
             forwarded = []

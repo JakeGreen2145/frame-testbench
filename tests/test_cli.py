@@ -45,6 +45,73 @@ class CliTests(unittest.TestCase):
                         'controllers': self.controllers}
         return Fake()
 
+    def test_controller_input_commands_are_single_atomic_batches(self):
+        cli = self.module()
+        common = ['system', 'bumper', 'trigger', 'grip', 'thumbstick']
+        for side, names in [('left', ['view', 'dpad_up', 'dpad_right', 'dpad_down', 'dpad_left']),
+                            ('right', ['menu', 'a', 'b', 'x', 'y'])]:
+            cases = [
+                (['button', name, 'on', '--touch', 'off'],
+                 f'/input/{name}/click 1 /input/{name}/touch 0') for name in common + names]
+            cases += [(['touch', name, 'on'], f'/input/{name}/touch 1')
+                      for name in common + names + ['thumbrest']]
+            cases += [
+                (['button', 'system', 'off'], '/input/system/click 0'),
+                (['trigger', '0.5'], '/input/trigger/value 0.5'),
+                (['grip', '1', '--click', 'off', '--touch', 'on'],
+                 '/input/grip/value 1 /input/grip/click 0 /input/grip/touch 1'),
+                (['trigger', '0', '--click', 'on'], '/input/trigger/value 0 /input/trigger/click 1'),
+                (['thumbstick', '-1', '1', '--touch', 'off', '--click', 'on'],
+                 '/input/thumbstick/x -1 /input/thumbstick/y 1 /input/thumbstick/click 1 /input/thumbstick/touch 0'),
+                (['thumbstick', '0', '0'], '/input/thumbstick/x 0 /input/thumbstick/y 0'),
+            ]
+            for argv, expected in cases:
+                with self.subTest(side=side, argv=argv):
+                    bench = self.bench()
+                    cli.dispatch(cli.parser().parse_args(['controller', side, *argv]), bench)
+                    self.assertEqual(bench.commands, [('control', f'controller-inputs {side} {expected}')])
+            bench = self.bench()
+            cli.dispatch(cli.parser().parse_args(['controller', side, 'inputs-reset']), bench)
+            self.assertEqual(bench.commands, [('control', 'controller-input-release ' + side)])
+
+    def test_invalid_input_batches_fail_before_local_or_remote_io(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        cli = self.module()
+        cases = [
+            ['left', 'button', name, 'on'] for name in ['a', 'b', 'x', 'y', 'menu', 'thumbrest', 'unknown']]
+        cases += [['right', 'touch', name, 'off'] for name in
+                  ['view', 'dpad_up', 'dpad_right', 'dpad_down', 'dpad_left', 'unknown']]
+        cases += [[side, op, value] for side in ['left', 'right']
+                  for op in ['trigger', 'grip'] for value in ['nan', 'inf', '-0.01', '1.01']]
+        cases += [['left', 'thumbstick', x, y] for x, y in
+                  [('nan', '0'), ('0', 'inf'), ('-1.01', '0'), ('0', '1.01')]]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                bench = self.bench()
+                args = cli.parser().parse_args(['controller', *argv])
+                with self.assertRaises(ValueError):
+                    cli.dispatch(args, bench)
+                self.assertEqual(bench.commands, [])
+                with patch.object(cli.transport, 'run_json') as run, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cli.main(['--host', 'frame', 'controller', *argv]), 1)
+                run.assert_not_called()
+
+    def test_bool_analog_values_rejected_before_io(self):
+        cli, bench = self.module(), self.bench()
+        args = cli.parser().parse_args(['controller', 'left', 'trigger', '0'])
+        args.value = True
+        with self.assertRaises(ValueError):
+            cli.dispatch(args, bench)
+        self.assertEqual(bench.commands, [])
+
+    def test_inputs_reads_observer_without_control_socket(self):
+        cli, bench = self.module(), self.bench()
+        result = cli.dispatch(cli.parser().parse_args(['inputs']), bench)
+        self.assertEqual(bench.commands, [('native', ('inputs', str(cli.ROOT / 'resources/input-actions.json')))])
+        self.assertIn('transforms', result)
+
     def test_compositor_mode(self):
         cli, bench = self.module(), self.bench()
         cli.dispatch(cli.parser().parse_args(['compositor', 'awake']), bench)

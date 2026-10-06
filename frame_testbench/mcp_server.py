@@ -18,12 +18,19 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
 from pydantic import Field
 
-from . import transport
+from . import controller_inputs, transport
 
 Number = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 Vector = tuple[Number, Number, Number]
 Space = Literal['standing', 'raw']
 Side = Literal['left', 'right']
+Button = Literal['system', 'bumper', 'trigger', 'grip', 'thumbstick',
+                 'view', 'dpad_up', 'dpad_right', 'dpad_down', 'dpad_left',
+                 'menu', 'a', 'b', 'x', 'y']
+TouchControl = Literal[Button, 'thumbrest']
+Boolean = Annotated[bool, Field(strict=True)]
+UnitInput = Annotated[float, Field(strict=True, allow_inf_nan=False, ge=0, le=1)]
+AxisInput = Annotated[float, Field(strict=True, allow_inf_nan=False, ge=-1, le=1)]
 
 
 @dataclass(frozen=True)
@@ -60,11 +67,18 @@ def result(data):
                           structuredContent=data, isError=False)
 
 
-def pose_arguments(kind, vector, rotation, space):
+def number(value):
     # argparse treats negative scientific notation as an option, not a number.
-    def number(value):
-        text = format(value, '.17g')
-        return format(Decimal(text), 'f') if 'e' in text else text
+    text = format(value, '.17g')
+    return format(Decimal(text), 'f') if 'e' in text else text
+
+
+def input_flags(clicked=None, touched=None):
+    return [item for flag, value in [('--click', clicked), ('--touch', touched)]
+            if value is not None for item in (flag, 'on' if value else 'off')]
+
+
+def pose_arguments(kind, vector, rotation, space):
     return [kind, *map(number, vector), '--rotation', *map(number, rotation), '--space', space]
 
 
@@ -159,8 +173,57 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def controller_pose_reset(side: Side) -> CallToolResult:
-        """Disconnect one synthetic controller, leaving HMD and other controller overrides unchanged."""
+        """Clear inputs and disconnect one synthetic controller, leaving other devices unchanged."""
         return await execute(['controller', side, 'reset'])
+
+    @server.tool()
+    async def controller_button(side: Side, button: Button, pressed: Boolean,
+                                touched: Boolean | None = None) -> CallToolResult:
+        """Set a button click, optionally touch. Requires pose set; omitted touch is unchanged.
+
+        Both sides: system, bumper, trigger, grip, thumbstick. Right: menu, a, b, x, y.
+        Left: view, dpad_up, dpad_right, dpad_down, dpad_left.
+        """
+        controller_inputs.validate_control(side, button)
+        return await execute(['controller', side, 'button', button, 'on' if pressed else 'off',
+                              *input_flags(touched=touched)])
+
+    @server.tool()
+    async def controller_trigger(side: Side, value: UnitInput, clicked: Boolean | None = None,
+                                 touched: Boolean | None = None) -> CallToolResult:
+        """Set trigger value 0..1. Requires pose set. Omitted click/touch stay unchanged; no threshold inference."""
+        return await execute(['controller', side, 'trigger', number(value), *input_flags(clicked, touched)])
+
+    @server.tool()
+    async def controller_grip(side: Side, value: UnitInput, clicked: Boolean | None = None,
+                              touched: Boolean | None = None) -> CallToolResult:
+        """Set grip value 0..1. Requires pose set. Omitted click/touch stay unchanged; no threshold inference."""
+        return await execute(['controller', side, 'grip', number(value), *input_flags(clicked, touched)])
+
+    @server.tool()
+    async def controller_thumbstick(side: Side, x: AxisInput, y: AxisInput,
+                                    clicked: Boolean | None = None, touched: Boolean | None = None) -> CallToolResult:
+        """Set thumbstick axes -1..1. Requires pose set. Omitted click/touch stay unchanged."""
+        return await execute(['controller', side, 'thumbstick', number(x), number(y), *input_flags(clicked, touched)])
+
+    @server.tool()
+    async def controller_touch(side: Side, control: TouchControl, touched: Boolean) -> CallToolResult:
+        """Set touch independently. Same handed names as controller_button, plus thumbrest on both sides.
+
+        Requires controller pose set first. Does not change click or analog values.
+        """
+        controller_inputs.validate_control(side, control, touch=True)
+        return await execute(['controller', side, 'touch', control, 'on' if touched else 'off'])
+
+    @server.tool()
+    async def controller_inputs_reset(side: Side) -> CallToolResult:
+        """Neutralize one controller's buttons, axes and touches, retaining its pose."""
+        return await execute(['controller', side, 'inputs-reset'])
+
+    @server.tool()
+    async def controller_input_status() -> CallToolResult:
+        """Read independent SteamVR controller actions, not the proxy's commanded input state."""
+        return await execute(['inputs'])
 
     @server.tool()
     async def compositor(mode: Literal['awake', 'auto']) -> CallToolResult:
@@ -182,7 +245,7 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def release_all() -> CallToolResult:
-        """Release all HMD/controller pose and worn overrides. Does not change compositor policy."""
+        """Clear controller inputs and release all pose/worn overrides. Does not change compositor policy."""
         return await execute(['release'])
 
     return server

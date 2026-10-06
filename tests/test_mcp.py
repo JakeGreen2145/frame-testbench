@@ -32,11 +32,99 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({t.name for t in tools}, {
             'status', 'worn', 'hmd_pose_set', 'hmd_pose_move', 'hmd_pose_reset',
             'controller_pose_set', 'controller_pose_move', 'controller_pose_reset',
+            'controller_button', 'controller_trigger', 'controller_grip', 'controller_thumbstick',
+            'controller_touch', 'controller_inputs_reset', 'controller_input_status',
             'compositor', 'capture', 'release_all'})
         for tool in tools:
             self.assertFalse(tool.inputSchema.get('additionalProperties', True))
             self.assertFalse({'host', 'socket', 'command', 'output', 'remote_root'} &
                              tool.inputSchema.get('properties', {}).keys())
+
+    async def test_controller_input_argv_and_omitted_fields(self):
+        cases = [('controller_input_status', {}, ['inputs'])]
+        for side, handed in [('left', ['view', 'dpad_up', 'dpad_right', 'dpad_down', 'dpad_left']),
+                             ('right', ['menu', 'a', 'b', 'x', 'y'])]:
+            names = ['system', 'bumper', 'trigger', 'grip', 'thumbstick'] + handed
+            for name in names:
+                cases.append(('controller_button', dict(side=side, button=name, pressed=True, touched=False),
+                              ['controller', side, 'button', name, 'on', '--touch', 'off']))
+            for name in names + ['thumbrest']:
+                cases.append(('controller_touch', dict(side=side, control=name, touched=True),
+                              ['controller', side, 'touch', name, 'on']))
+            for op in ['trigger', 'grip']:
+                cases.extend([
+                    ('controller_' + op, dict(side=side, value=0.5), ['controller', side, op, '0.5']),
+                    ('controller_' + op, dict(side=side, value=0, clicked=True, touched=False),
+                     ['controller', side, op, '0', '--click', 'on', '--touch', 'off']),
+                    ('controller_' + op, dict(side=side, value=1, clicked=False),
+                     ['controller', side, op, '1', '--click', 'off'])])
+            cases.extend([
+                ('controller_button', dict(side=side, button='system', pressed=False),
+                 ['controller', side, 'button', 'system', 'off']),
+                ('controller_thumbstick', dict(side=side, x=-1, y=1, clicked=False, touched=True),
+                 ['controller', side, 'thumbstick', '-1', '1', '--click', 'off', '--touch', 'on']),
+                ('controller_thumbstick', dict(side=side, x=0, y=0),
+                 ['controller', side, 'thumbstick', '0', '0']),
+                ('controller_inputs_reset', dict(side=side), ['controller', side, 'inputs-reset'])])
+        for name, args, expected in cases:
+            with self.subTest(name=name, args=args):
+                reply = await self.server.call_tool(name, args)
+                self.assertFalse(reply.isError, reply)
+                self.assertEqual(self.calls[-1], expected)
+
+    async def test_controller_input_schema_and_validation_before_backend(self):
+        tools = {t.name: t for t in await self.server.list_tools()}
+        self.assertIn('controller_trigger', tools)
+        for name, fields, lower in [('controller_trigger', ['value'], 0),
+                                    ('controller_grip', ['value'], 0),
+                                    ('controller_thumbstick', ['x', 'y'], -1)]:
+            for field in fields:
+                schema = tools[name].inputSchema['properties'][field]
+                self.assertEqual((schema['type'], schema['minimum'], schema['maximum']), ('number', lower, 1))
+        cases = [('controller_inputs_reset', {'side': 'all'}),
+                 ('controller_input_status', {'side': 'left'}),
+                 ('controller_button', dict(side='left', button='a', pressed=True)),
+                 ('controller_button', dict(side='right', button='view', pressed=True)),
+                 ('controller_button', dict(side='left', button='thumbrest', pressed=True)),
+                 ('controller_touch', dict(side='right', control='dpad_up', touched=True)),
+                 ('controller_touch', dict(side='left', control='menu', touched=True)),
+                 ('controller_touch', dict(side='left', control='/input/system/touch', touched=True)),
+                 ('controller_button', dict(side='left', button='system', pressed='on')),
+                 ('controller_button', dict(side='left', button='system', pressed=1)),
+                 ('controller_button', dict(side='left', button='system', pressed=True, touched=0)),
+                 ('controller_touch', dict(side='left', control='system', touched='false')),
+                 ('controller_trigger', dict(side='left', value=0, clicked='on')),
+                 ('controller_thumbstick', dict(side='left', x=0, y=0, touched=1))]
+        for name, fields in [('controller_trigger', ['value']), ('controller_grip', ['value']),
+                             ('controller_thumbstick', ['x', 'y'])]:
+            for field in fields:
+                for value in [True, False, '0.5', None, float('nan'), float('inf'), -float('inf'), -1.01, 1.01]:
+                    args = dict(side='left', **{key: 0 for key in fields})
+                    args[field] = value
+                    cases.append((name, args))
+        for name, args in cases:
+            with self.subTest(name=name, args=args):
+                reply = await self.server.call_tool(name, args)
+                self.assertTrue(reply.isError, reply)
+                self.assertEqual(self.calls, [])
+
+    async def test_controller_input_backend_refusal_is_normal_error(self):
+        def run(argv):
+            raise RuntimeError('controller pose set required')
+        server = self.module.create_server(self.module.Config(), runner=run)
+        reply = await server.call_tool('controller_trigger', {'side': 'left', 'value': 1})
+        self.assertTrue(reply.isError)
+        self.assertIn('controller pose set required', reply.content[0].text)
+
+    async def test_thumbstick_small_negative_values_survive_argparse(self):
+        from frame_testbench import cli
+        def run(argv):
+            args = cli.parser().parse_args(argv)
+            return {'ok': True, 'x': args.x, 'y': args.y}
+        server = self.module.create_server(self.module.Config(), runner=run)
+        reply = await server.call_tool('controller_thumbstick', {'side': 'left', 'x': -1e-8, 'y': -5e-324})
+        self.assertFalse(reply.isError, reply)
+        self.assertEqual(reply.structuredContent, {'ok': True, 'x': -1e-8, 'y': -5e-324})
 
     async def test_invalid_arguments_never_reach_backend(self):
         cases = [
