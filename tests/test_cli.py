@@ -22,7 +22,7 @@ class CliTests(unittest.TestCase):
                 self.on = False
             def native(self, *args):
                 self.commands.append(('native', args))
-                return {'raw_to_standing': pose.to_matrix(pose.from_euler([0, 1.6, 0], [0, 0, 0]))}
+                return {'transforms': {'raw_to_standing': [[1, 0, 0, 0], [0, 1, 0, 1.6], [0, 0, 1, 0]]}}
             def control(self, text):
                 self.commands.append(('control', text))
                 bits = text.split()
@@ -32,6 +32,13 @@ class CliTests(unittest.TestCase):
                     self.on = True
                 return {'ok': True, 'pose_override': self.on, 'pose': self.current}
         return Fake()
+
+    def test_compositor_mode(self):
+        cli, bench = self.module(), self.bench()
+        cli.dispatch(cli.parser().parse_args(['compositor', 'awake']), bench)
+        self.assertEqual(bench.commands[-1], ('native', ('setting', 'false')))
+        cli.dispatch(cli.parser().parse_args(['compositor', 'auto']), bench)
+        self.assertEqual(bench.commands[-1], ('native', ('setting', 'true')))
 
     def test_worn_and_release(self):
         cli, bench = self.module(), self.bench()
@@ -66,6 +73,28 @@ class CliTests(unittest.TestCase):
             cli.dispatch(args, bench)
         self.assertEqual(bench.commands, [])
 
+    def test_capture_native_owns_directory_creation(self):
+        cli = self.module()
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'fresh'
+            bench = cli.Bench()
+            def native(*args):
+                if args[0] == 'status':
+                    return {'compositor': {'frame_index': 1}, 'hmd': {'poses': {}}}
+                self.assertEqual(args[0], 'capture')
+                directory = Path(args[1])
+                self.assertFalse(directory.exists())
+                directory.mkdir()
+                for name in ('preview.png', 'stereo.png'):
+                    (directory / name).write_bytes(b'fixture')
+                return {'ok': True}
+            with patch.object(bench, 'native', side_effect=native):
+                result = bench.capture(str(out))
+            self.assertEqual(result['files']['stereo.png'], str(out / 'stereo.png'))
+            self.assertIn('runtime_before', result)
+            self.assertIn('runtime_after', result)
+
     def test_remote_capture_fetch_writes_local_artifacts(self):
         cli = self.module()
         from unittest.mock import patch
@@ -92,7 +121,7 @@ class CliTests(unittest.TestCase):
             raise FileNotFoundError('not installed')
         bench.control = refused
         result = cli.dispatch(cli.parser().parse_args(['status']), bench)
-        self.assertIn('raw_to_standing', result['runtime'])
+        self.assertIn('raw_to_standing', result['runtime']['transforms'])
         self.assertFalse(result['input']['available'])
 
 

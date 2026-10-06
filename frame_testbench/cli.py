@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
+import uuid
 from . import install, pose, transport
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,17 +21,20 @@ class Bench:
 
     def native(self, *arguments):
         binary = os.environ.get('FRAME_TESTBENCH_OBSERVER', str(ROOT / 'build/frame-observe'))
-        return transport.run_json([binary, *map(str, arguments)])
+        return transport.run_json([binary, *map(str, arguments)], timeout=125)
 
     def capture(self, output):
         if output:
             directory = Path(output).resolve()
-            directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+            directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         else:
             parent = ROOT / 'artifacts'
             parent.mkdir(mode=0o700, exist_ok=True)
-            directory = Path(tempfile.mkdtemp(prefix='capture-', dir=parent))
+            directory = parent / ('capture-' + uuid.uuid4().hex)
+        before = self.native('status')
         result = self.native('capture', str(directory))
+        result['runtime_before'] = before
+        result['runtime_after'] = self.native('status')
         result['output'] = str(directory)
         result['files'] = {name: str(directory / name) for name in ('preview.png', 'stereo.png')
                            if (directory / name).is_file()}
@@ -67,6 +70,8 @@ def parser():
     ap.add_argument('--socket', help='override local input control socket')
     commands = ap.add_subparsers(dest='command', required=True)
     commands.add_parser('status', help='runtime poses, frames and input override readback')
+    compositor = commands.add_parser('compositor', help='persistently control compositor standby policy')
+    compositor.add_argument('mode', choices=('awake', 'auto'))
     worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
     worn.add_argument('state', choices=('on', 'off', 'physical'))
     p = commands.add_parser('pose', help='override the actual HMD pose')
@@ -99,6 +104,8 @@ def dispatch(args, bench):
         except (OSError, RuntimeError) as error:
             state = {'available': False, 'error': str(error)}
         return {'ok': True, 'runtime': runtime, 'input': state}
+    if args.command == 'compositor':
+        return bench.native('setting', 'false' if args.mode == 'awake' else 'true')
     if args.command == 'worn':
         return bench.control({'on': 'worn 1', 'off': 'worn 0', 'physical': 'worn-release'}[args.state])
     if args.command == 'release':
@@ -116,7 +123,8 @@ def dispatch(args, bench):
             desired = state['pose']
         transform = None
         if args.space == 'standing':
-            transform = pose.from_matrix(bench.native('status')['raw_to_standing'])
+            matrix = bench.native('status')['transforms']['raw_to_standing']
+            transform = pose.from_matrix([value for row in matrix for value in row])
             if args.pose_command == 'move':
                 desired = pose.compose(transform, desired)
         if args.pose_command == 'move':

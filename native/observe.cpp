@@ -213,7 +213,8 @@ std::string capture(Sdk &sdk, const fs::path &directory) {
     const std::string preview = (directory / "preview.png").string();
     const std::string stereo = (directory / "stereo.png").string();
     vr::ScreenshotHandle_t handle = vr::k_unScreenshotHandleInvalid;
-    const auto error = screenshots->RequestScreenshot(&handle, vr::VRScreenshotType_Stereo, preview.c_str(), stereo.c_str());
+    const auto error = screenshots->RequestScreenshot(&handle, vr::VRScreenshotType_Stereo,
+        (directory / "preview").c_str(), (directory / "stereo").c_str());
     if (error != vr::VRScreenshotError_None || handle == vr::k_unScreenshotHandleInvalid)
         throw std::runtime_error("RequestScreenshot failed: " + std::to_string(error));
     // The process-wide alarm also bounds hung SDK calls and shutdown. Failed or

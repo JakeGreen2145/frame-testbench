@@ -57,7 +57,8 @@ def fake_source():
         'RequestScreenshot': '''if(type!=VRScreenshotType_Stereo) abort(); log("request_screenshot");
             if(mode("screenshot_error")) return VRScreenshotError_RequestFailed;
             *pOutScreenshotHandle=77;
-            std::string a=pchPreviewFilename,b=pchVRFilename;
+            // Steam Frame's compositor appends .png to API filename prefixes.
+            std::string a=std::string(pchPreviewFilename)+".png",b=std::string(pchVRFilename)+".png";
             worker=std::thread([a,b]{
                 auto bytes=image;
                 if(mode("corrupt")) bytes[45]^=1;
