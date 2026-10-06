@@ -66,6 +66,26 @@ class CliTests(unittest.TestCase):
             cli.dispatch(args, bench)
         self.assertEqual(bench.commands, [])
 
+    def test_remote_capture_fetch_writes_local_artifacts(self):
+        cli = self.module()
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'capture'
+            reply = {'ok': True, 'output': '/remote/artifacts/capture-123',
+                     'files': {'stereo.png': '/remote/artifacts/capture-123/stereo.png',
+                               'preview.png': '/remote/artifacts/capture-123/preview.png'}}
+            calls = []
+            def copy(argv, **kwargs):
+                calls.append(argv)
+                Path(argv[-1]).write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+            with patch.object(cli.subprocess, 'run', side_effect=copy):
+                result = cli.fetch_capture('frame', reply, out)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(Path(result['local_files']['stereo.png']).parent, out)
+            self.assertTrue((out / 'result.json').is_file())
+            with self.assertRaises(FileExistsError):
+                cli.fetch_capture('frame', reply, out)
+
     def test_status_without_proxy_still_observes(self):
         cli, bench = self.module(), self.bench()
         def refused(text):

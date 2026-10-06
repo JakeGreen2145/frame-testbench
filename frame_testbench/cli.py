@@ -39,6 +39,27 @@ class Bench:
         return result
 
 
+def fetch_capture(host, result, output):
+    transport.remote_argv(host, '.', [])  # validate host before scp
+    directory = Path(output).resolve()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    local = {}
+    for name in ('preview.png', 'stereo.png'):
+        remote = result['files'][name]
+        if not remote.startswith('/') or Path(remote).name != name or any(ord(c) < 32 for c in remote):
+            raise ValueError('invalid remote capture path')
+        dest = directory / name
+        subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                        '--', f'{host}:{remote}', str(dest)], check=True, timeout=45)
+        with dest.open('rb') as stream:
+            if stream.read(8) != b'\x89PNG\r\n\x1a\n':
+                raise ValueError('download is not PNG')
+        local[name] = str(dest)
+    result = dict(result, local_files=local)
+    (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    return result
+
+
 def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--host', help='SSH host alias; commands execute on the headset')
@@ -62,6 +83,7 @@ def parser():
     commands.add_parser('release', help='restore physical pose and proximity')
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
+    capture.add_argument('--fetch', help='with --host, download PNGs into this new local directory')
     for name in ('install', 'uninstall'):
         p = commands.add_parser(name, help='change only the SteamVR user service override')
         p.add_argument('--restart', action='store_true', help='restart SteamVR now; interrupts VR')
@@ -125,16 +147,20 @@ def main(argv=None):
             i = 0
             while i < len(arguments):
                 item = arguments[i]
-                if item in ('--host', '--remote-root'):
+                if item in ('--host', '--remote-root', '--fetch'):
                     i += 2
                     continue
-                if item.startswith(('--host=', '--remote-root=')):
+                if item.startswith(('--host=', '--remote-root=', '--fetch=')):
                     i += 1
                     continue
                 forwarded.append(item)
                 i += 1
             result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=110)
+            if args.command == 'capture' and args.fetch:
+                result = fetch_capture(args.host, result, args.fetch)
         else:
+            if args.command == 'capture' and args.fetch:
+                raise ValueError('--fetch requires --host; use --output for local capture')
             result = dispatch(args, Bench(args.socket))
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0
