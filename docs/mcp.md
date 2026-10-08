@@ -183,19 +183,27 @@ Do not apply virtual tracking overrides while someone relies on normal tracking.
 
 ### Recording
 
-Call `record` with no arguments for 10 seconds at a requested 5 fps in stereo,
-or supply strict integer `duration_seconds` from 1 to 60 and `fps` from 1 to 10.
-Booleans, strings, fractional numbers, and integer-valued floats are rejected.
-`view` is `stereo` by default or `preview`. For example:
+Call `record` with no arguments for a continuous 10-second, 30-fps left-eye
+headset-view recording. `duration_seconds` accepts strict integers from 1 to 60;
+`fps` accepts 1 to 60 for `view="headset"`. Booleans, strings, fractional numbers,
+and integer-valued floats are rejected. For example:
 
 ```json
-{"duration_seconds": 10, "fps": 5, "view": "stereo"}
+{"duration_seconds": 10, "fps": 30, "view": "headset"}
 ```
 
-The recording samples compositor screenshots and encodes an MP4. This is not a
-real-time compositor mirror or headset-refresh-rate video. The public GL mirror
-is unavailable on Steam Frame. Requested sampling rates do not guarantee actual
-capture rates; inspect the returned recording metadata and `timeline.json`.
+The default path uses Framecorder's Vulkan texture acquisition and Qualcomm
+hardware H.264 encoder, not repeated screenshots. It requires the explicit
+capture-host setup in [recording.md](recording.md). No audio, microphone,
+privileged helper, or automatic pose/power changes are enabled. It is a single
+left-eye view, not stereo panel scanout.
+
+`view="stereo"` and `view="preview"` retain the legacy screenshot-sampling path;
+set `fps` explicitly to 1..10 for those views. There is no silent fallback.
+Requested rates and encoded frame counts do not prove fresh source frames;
+inspect changing content and the returned metadata. A failed GL mirror probe
+only established that particular call failed, not that all continuous capture
+interfaces are unavailable; see [the capture research](continuous-capture-research.md).
 
 Pose and controller input calls can run while a recording is active. The client
 must issue those calls concurrently rather than waiting for `record` to return.

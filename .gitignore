@@ -5,3 +5,4 @@ __pycache__/
 artifacts/
 *.egg-info/
 .pytest_cache/
+tools/

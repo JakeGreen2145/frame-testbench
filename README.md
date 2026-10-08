@@ -9,7 +9,7 @@ Headset and controller input tools for closed-loop development on Steam Frame. A
 - Independent left/right synthetic controller translation and rotation, without requiring powered physical controllers.
 - Frame-profile buttons, touches, trigger/grip values, and thumbstick axes.
 - SteamVR stereo screenshots, with runtime pose/frame metadata and optional downloads to the agent machine.
-- Sampled compositor video recordings with measured timing, H.264 MP4 output, and SSH downloads.
+- Continuous 1080p headset-view video through Vulkan and the Frame's hardware encoder, with H.264 MP4 output and SSH downloads. Explicit sampled stereo recording remains available.
 
 Input overrides stay active across CLI calls. `release` restores physical input. There is no per-screenshot activation/rollback cycle. Do not wear the headset while another person or agent is driving its pose.
 
@@ -108,11 +108,16 @@ For an agent, the loop is: set input, read `status`, capture, inspect `local_fil
 ## Video recording
 
 ```sh
-./frame-testbench --host frame record --duration 10 --fps 5 --view stereo \
+# Explicit, one-time install of the checksum-pinned rootless recorder on Frame.
+ssh frame 'cd dev/frame-testbench && python3 scripts/setup-framecorder.py'
+# Default: continuous 1080p30 left-eye headset view, silent H.264.
+./frame-testbench --host frame record --duration 10 \
   --fetch artifacts/video-test
 ```
 
-The MCP `record` tool takes `duration_seconds`, `fps`, and `view`, and returns video/timeline file links. Input tools can run concurrently. FFmpeg with libx264 and ffprobe are required on the capture host only. This is a sampled screenshot recording, not headset-rate video. Measured sample intervals are preserved rather than compressed to the requested FPS. See [recording behavior, timing, and limits](docs/recording.md).
+The MCP `record` tool defaults to `view="headset"`, `fps=30`, and `duration_seconds=10`; it returns video/timeline file links while input tools remain available. Framecorder acquires the SteamVR headset-view Vulkan texture and uses the Snapdragon hardware encoder, without intermediate PNGs or CPU video encoding. The Framecorder executable and ffprobe are required only on the capture host. No privileged helper, service, microphone, or implicit pose/power change is enabled.
+
+`--view stereo --fps 5` and `--view preview --fps 5` retain the older sampled-screenshot path when explicitly requested. There is no silent screenshot fallback. The continuous view is left-eye only, not full stereo panel scanout. See [recording behavior and setup](docs/recording.md) and [capture-method research with hardware measurements](docs/continuous-capture-research.md).
 
 ## Capture limits
 
@@ -145,6 +150,6 @@ This leaves the stock runtime and its driver files untouched. The proxy starts w
 
 ## Verification
 
-`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md), [controller/MCP validation](docs/controller-mcp-validation.md), [button/analog/touch validation](docs/input-validation.md), and [recording validation](docs/recording-validation.md).
+`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md), [controller/MCP validation](docs/controller-mcp-validation.md), [button/analog/touch validation](docs/input-validation.md), and [original screenshot-recording validation](docs/recording-validation.md), plus [continuous hardware-recording validation](docs/continuous-recording-validation.md).
 
 OpenVR headers retain Valve's license under `vendor/`. The remaining project code is MIT licensed.
