@@ -20,7 +20,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, ResourceLink, TextContent
 from pydantic import Field
 
-from . import controller_inputs, transport
+from . import controller_inputs, recording, transport
 
 Number = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 Vector = tuple[Number, Number, Number]
@@ -283,12 +283,18 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def record(duration_seconds: Annotated[int, Field(strict=True, ge=1, le=60)] = 10,
-                     fps: Annotated[int, Field(strict=True, ge=1, le=10)] = 5,
-                     view: Literal['preview', 'stereo'] = 'stereo') -> CallToolResult:
-        """Record sampled compositor screenshots as MP4 and timeline file links.
+                     fps: Annotated[int, Field(strict=True, ge=1, le=60)] = 30,
+                     view: Literal['headset', 'preview', 'stereo'] = 'headset') -> CallToolResult:
+        """Record continuous headset video as MP4 and timeline file links, no audio.
 
-        Not a real-time compositor mirror. Pose/input tools remain available during recording.
+        Default headset view: rootless 1920x1080 left-eye VR texture capture through
+        Framecorder Vulkan and Iris hardware encoding, no PNG sampling. Headset fps
+        accepts 1..60, default 30. Preview/stereo use legacy sampled screenshots at
+        1..10 fps; request that rate explicitly. No automatic rate reduction.
+        Requires an active compositor; does not change pose, proximity or power policy.
+        Pose/input tools remain available during recording.
         """
+        recording.validate(duration_seconds, fps, view)
         async with recording_lock:
             parent = config.artifacts_dir.expanduser().resolve()
             parent.mkdir(mode=0o700, parents=True, exist_ok=True)

@@ -114,10 +114,17 @@ def parser():
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
     capture.add_argument('--fetch', help='with --host, download PNGs into this new local directory')
-    record = commands.add_parser('record', help='sample compositor screenshots into a timed H.264 MP4; no audio')
-    record.add_argument('--duration', type=int, default=10, help='recording window in seconds, 1..60')
-    record.add_argument('--fps', type=int, default=5, help='requested sampling rate, 1..10; actual rate may be lower')
-    record.add_argument('--view', choices=('preview', 'stereo'), default='stereo')
+    record = commands.add_parser('record', help='record continuous headset video or explicit sampled screenshots; no audio',
+        description='Record a silent H.264 MP4 and timeline. Default headset view is a rootless '
+                    '1920x1080 left-eye VR texture capture through Framecorder Vulkan and Iris hardware encoding, '
+                    'with no PNG sampling. Requires an active compositor; does not change pose, proximity or power policy. '
+                    'Preview and stereo use legacy sampled screenshots, not continuous video.')
+    record.add_argument('--duration', type=int, default=10, help='recording window in seconds, 1..60; default 10')
+    record.add_argument('--fps', type=int, default=30,
+                        help='requested rate: headset 1..60, default 30; sampled preview/stereo 1..10, '
+                             'actual sample rate may be lower; no automatic rate reduction')
+    record.add_argument('--view', choices=('headset', 'preview', 'stereo'), default='headset',
+                        help='headset is continuous video, no audio; preview/stereo are sampled screenshots')
     record.add_argument('--output', help='fresh output directory on capture host')
     record.add_argument('--fetch', help='with --host, fetch video and timeline into a fresh local directory')
     for name in ('install', 'uninstall'):

@@ -130,6 +130,46 @@ create_server(Config(artifacts_dir=Path(sys.argv[1])), runner=recording_fixture)
                         refused = await client.call_tool('record', invalid)
                         self.assertTrue(refused.isError, refused)
 
+    async def test_headset_defaults_and_maximum_rate_over_real_sdk_stdio(self):
+        """Verify API arguments over stdio; synthetic artifacts are not headset evidence."""
+        import anyio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        code = '''
+import sys
+from pathlib import Path
+from frame_testbench.mcp_server import Config, create_server
+from test_mcp_record import recording_fixture
+def run(argv):
+    data = recording_fixture(argv)
+    data['argv'] = argv
+    return data
+create_server(Config(artifacts_dir=Path(sys.argv[1])), runner=run).run(transport='stdio')
+'''
+        root = self.directory / 'recordings'
+        env = dict(self.env, PYTHONPATH=os.pathsep.join([str(ROOT), str(ROOT / 'tests')]))
+        params = StdioServerParameters(command=sys.executable,
+            args=['-c', code, str(root)], env=env, cwd=str(self.directory))
+        with anyio.fail_after(20):
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                    self.assertEqual(tools['record'].inputSchema['properties']['fps']['maximum'], 60)
+                    for invalid in [{'view': 'preview'}, {'view': 'stereo', 'fps': 11},
+                                    {'fps': 61}, {'fps': '30'}, {'fps': 30.0}]:
+                        reply = await client.call_tool('record', invalid)
+                        self.assertTrue(reply.isError, reply)
+                        self.assertFalse(root.exists())
+                    for args, fps in [({}, '30'), ({'fps': 60, 'view': 'headset'}, '60')]:
+                        reply = await client.call_tool('record', args)
+                        self.assertFalse(reply.isError, reply)
+                        self.assertEqual(reply.structuredContent['argv'][:-1],
+                                         ['record', '--duration', '10', '--fps', fps,
+                                          '--view', 'headset', '--output'])
+                        self.assertEqual({c.name for c in reply.content if c.type == 'resource_link'},
+                                         {'recording.mp4', 'timeline.json'})
+
     async def test_cli_child_cannot_consume_mcp_protocol_stdin(self):
         observer = self.directory / 'stdin-observer'
         observer.write_text(f'''#!{sys.executable}

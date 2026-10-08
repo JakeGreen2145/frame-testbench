@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SDK_AVAILABLE = importlib.util.find_spec('mcp') is not None
 # Deliberately not a playable video. Only the container signature is under test.
@@ -48,19 +49,50 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         schema = tools['record'].inputSchema
         self.assertFalse(schema['additionalProperties'])
         self.assertEqual(set(schema['properties']), {'duration_seconds', 'fps', 'view'})
-        for name, upper, default in [('duration_seconds', 60, 10), ('fps', 10, 5)]:
+        for name, upper, default in [('duration_seconds', 60, 10), ('fps', 60, 30)]:
             field = schema['properties'][name]
             self.assertEqual((field['type'], field['minimum'], field['maximum'], field['default']),
                              ('integer', 1, upper, default))
-        self.assertEqual(schema['properties']['view']['enum'], ['preview', 'stereo'])
-        self.assertEqual(schema['properties']['view']['default'], 'stereo')
+        self.assertEqual(schema['properties']['view']['enum'], ['headset', 'preview', 'stereo'])
+        self.assertEqual(schema['properties']['view']['default'], 'headset')
+
+    async def test_record_description_explains_backends_and_prerequisites(self):
+        tools = {t.name: t for t in await self.server().list_tools()}
+        text = ' '.join(tools['record'].description.split()).lower()
+        for phrase in ['headset', '30', '1..60', '1..10', 'rootless', '1920x1080',
+                       'left-eye', 'framecorder', 'vulkan', 'iris', 'no audio', 'no png',
+                       'active compositor', 'pose', 'power', 'sampled', 'screenshots']:
+            self.assertIn(phrase, text)
+
+    async def test_shared_validation_precedes_filesystem_and_runner(self):
+        from frame_testbench import recording
+        def run(argv):
+            validate.assert_called_once_with(10, 5, 'stereo')
+            return recording_fixture(argv)
+        with patch.object(recording, 'validate', wraps=recording.validate) as validate:
+            reply = await self.server(run).call_tool('record', {'fps': 5, 'view': 'stereo'})
+        self.assertFalse(reply.isError, reply)
+        validate.assert_called_once_with(10, 5, 'stereo')
+
+    async def test_sampled_rates_above_ten_fail_before_filesystem_or_runner(self):
+        for view in ('preview', 'stereo'):
+            for extra in ({}, {'fps': 11}, {'fps': 30}, {'fps': 60}):
+                with self.subTest(view=view, extra=extra):
+                    server = self.server(lambda argv: self.fail('must not start runner'))
+                    with patch.object(Path, 'mkdir') as mkdir, \
+                         patch.object(self.module.tempfile, 'mkdtemp') as mkdtemp:
+                        reply = await server.call_tool('record', dict(view=view, **extra))
+                    self.assertTrue(reply.isError, reply)
+                    mkdir.assert_not_called()
+                    mkdtemp.assert_not_called()
+                    self.assertEqual(list(self.root.iterdir()), [])
 
     async def test_invalid_arguments_never_start_runner(self):
         calls = []
         server = self.server(lambda argv: calls.append(argv))
         cases = [{'view': value} for value in ['both', None, 1, True]]
         cases += [{'host': 'other'}, {'output': '/etc'}, {'extra': 1}]
-        for name, upper in [('duration_seconds', 60), ('fps', 10)]:
+        for name, upper in [('duration_seconds', 60), ('fps', 60)]:
             cases += [{name: value} for value in [0, -1, upper + 1, True, False, 1.0, 1.5, '1', None,
                                                  float('nan'), float('inf')]]
         for args in cases:
@@ -68,14 +100,18 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
                 reply = await server.call_tool('record', args)
                 self.assertTrue(reply.isError, reply)
                 self.assertEqual(calls, [])
+                self.assertEqual(list(self.root.iterdir()), [])
                 self.assertNotIn('unknown tool', reply.content[0].text)
 
     async def test_local_remote_argv_owned_fresh_paths_metadata_and_links(self):
         directories = []
         for host in [None, 'frame']:
-            for args, values in [({}, ['10', '5', 'stereo']),
+            for args, values in [({}, ['10', '30', 'headset']),
                                  ({'duration_seconds': 1, 'fps': 1, 'view': 'preview'}, ['1', '1', 'preview']),
-                                 ({'duration_seconds': 60, 'fps': 10}, ['60', '10', 'stereo'])]:
+                                 ({'duration_seconds': 60, 'fps': 60, 'view': 'headset'}, ['60', '60', 'headset']),
+                                 ({'fps': 1, 'view': 'headset'}, ['10', '1', 'headset']),
+                                 ({'fps': 10, 'view': 'preview'}, ['10', '10', 'preview']),
+                                 ({'duration_seconds': 60, 'fps': 10, 'view': 'stereo'}, ['60', '10', 'stereo'])]:
                 def run(argv, host=host, values=values):
                     prefix = ['--host', host, '--remote-root', 'dev/bench space; literal'] if host else []
                     self.assertEqual(argv[:-1], prefix + ['record', '--duration', values[0], '--fps', values[1],
@@ -107,7 +143,7 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
                     if isinstance(failure, Exception):
                         raise failure
                     return failure
-                reply = await self.server(run).call_tool('record', {})
+                reply = await self.server(run).call_tool('record', {'fps': 5, 'view': 'stereo'})
                 self.assertTrue(reply.isError, reply)
                 self.assertNotIn('unknown tool', reply.content[0].text)
                 self.assertFalse(any(c.type == 'resource_link' for c in reply.content))
@@ -149,7 +185,7 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
                             elif failure == 'bad-files':
                                 data['local_files' if host else 'files'] = []
                             return data
-                        reply = await self.server(run, host).call_tool('record', {})
+                        reply = await self.server(run, host).call_tool('record', {'fps': 5, 'view': 'stereo'})
                         self.assertTrue(reply.isError, reply)
                         self.assertNotIn('unknown tool', reply.content[0].text)
                         self.assertFalse(any(c.type == 'resource_link' for c in reply.content))
@@ -168,7 +204,7 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         def read_chars():
             return int(Path('/proc/self/io').read_text().split('rchar: ')[1].splitlines()[0])
         before = read_chars()
-        reply = await self.server(run).call_tool('record', {})
+        reply = await self.server(run).call_tool('record', {'fps': 5, 'view': 'stereo'})
         self.assertFalse(reply.isError, reply)
         self.assertLess(read_chars() - before, 16 * 1024 * 1024)
         self.assertEqual(paths[0].stat().st_size, 512 * 1024 * 1024)
@@ -184,7 +220,7 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             return {'ok': True, 'argv': argv}
         server = self.server(run)
         self.assertIn('record', {tool.name for tool in await server.list_tools()})
-        first = asyncio.create_task(server.call_tool('record', {}))
+        first = asyncio.create_task(server.call_tool('record', {'fps': 5, 'view': 'stereo'}))
         try:
             async with asyncio.timeout(2):
                 while not entered.is_set():
@@ -216,9 +252,9 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('record', {tool.name for tool in await server.list_tools()})
         async def first():
             with scope:
-                await server.call_tool('record', {})
+                await server.call_tool('record', {'fps': 5, 'view': 'stereo'})
         async def second():
-            replies.append(await server.call_tool('record', {}))
+            replies.append(await server.call_tool('record', {'fps': 5, 'view': 'stereo'}))
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(first)
             try:

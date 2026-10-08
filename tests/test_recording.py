@@ -48,7 +48,9 @@ class RecordingTests(unittest.TestCase):
         module = self.module()
         for duration, fps, view in [(0,5,'stereo'), (61,5,'stereo'), (True,5,'stereo'),
                                    (1.5,5,'stereo'), (10,0,'stereo'), (10,11,'stereo'),
-                                   (10,True,'stereo'), (10,5,'bad')]:
+                                   (10,True,'stereo'), (10,5,'bad'), (10,11,'preview'),
+                                   (10,61,'headset'), (10,0,'headset'), (10,True,'headset'),
+                                   (10,30.0,'headset'), (10,'30','headset')]:
             with self.subTest(args=(duration, fps, view)):
                 with self.assertRaises(ValueError):
                     module.validate(duration, fps, view)
@@ -117,15 +119,60 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue((out/'frame-000000/preview.png').exists())
             self.assertFalse((out/'result.json').exists())
 
+    def test_headset_validation_accepts_full_rate_range(self):
+        for fps in (1, 30, 60):
+            with self.subTest(fps=fps):
+                self.module().validate(10, fps, 'headset')
+
+    def test_cli_record_defaults_and_explicit_views(self):
+        from frame_testbench import cli
+        args = cli.parser().parse_args(['record'])
+        self.assertEqual((args.duration, args.fps, args.view), (10, 30, 'headset'))
+        for view, fps in [('headset', 60), ('preview', 10), ('stereo', 10)]:
+            args = cli.parser().parse_args(['record', '--view', view, '--fps', str(fps)])
+            self.assertEqual((args.view, args.fps), (view, fps))
+        # Selecting a sampled view must not silently lower the default rate.
+        args = cli.parser().parse_args(['record', '--view', 'preview'])
+        self.assertEqual(args.fps, 30)
+
+    def test_cli_record_help_distinguishes_continuous_and_sampled_views(self):
+        from frame_testbench import cli
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit):
+            cli.parser().parse_args(['record', '--help'])
+        text = ' '.join(output.getvalue().split()).lower()
+        for phrase in ['headset', '30', '1..60', '1..10', 'rootless', '1920x1080',
+                       'left-eye', 'framecorder', 'vulkan', 'iris', 'no audio', 'no png',
+                       'active compositor', 'pose', 'power', 'sampled', 'screenshots']:
+            self.assertIn(phrase, text)
+
+    def test_cli_invalid_recording_never_creates_directory_or_starts_io(self):
+        from frame_testbench import cli
+        cases = [('headset', '61'), ('headset', '0'), ('preview', '11'), ('stereo', '30')]
+        for host in ([], ['--host', 'frame']):
+            for view, fps in cases:
+                with self.subTest(host=host, view=view, fps=fps), tempfile.TemporaryDirectory() as tmp:
+                    target = Path(tmp) / 'new-parent' / 'recording'
+                    with patch.object(cli.transport, 'run_json') as remote, \
+                         patch.object(cli.recording, 'record') as record, \
+                         patch.object(cli.recording, 'fetch') as fetch, \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(cli.main([*host, 'record', '--view', view, '--fps', fps,
+                                                  '--fetch' if host else '--output', str(target)]), 1)
+                    remote.assert_not_called()
+                    record.assert_not_called()
+                    fetch.assert_not_called()
+                    self.assertFalse(target.parent.exists())
+
     def test_cli_defaults_dispatch_and_validation_before_ssh(self):
         from frame_testbench import cli
         self.assertIn('record', cli.parser()._subparsers._group_actions[0].choices)
         args = cli.parser().parse_args(['record'])
-        self.assertEqual((args.duration,args.fps,args.view), (10,5,'stereo'))
+        self.assertEqual((args.duration,args.fps,args.view), (10,30,'headset'))
         bench=cli.Bench()
         with patch.object(bench,'record',return_value={'ok':True}) as record:
             cli.dispatch(args,bench)
-        record.assert_called_once_with(None,10,5,'stereo')
+        record.assert_called_once_with(None,10,30,'headset')
         with patch.object(cli.transport,'run_json') as remote, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(['--host','frame','record','--duration','61']),1)
         remote.assert_not_called()
@@ -150,7 +197,7 @@ class RecordingTests(unittest.TestCase):
         from frame_testbench import cli
         with tempfile.TemporaryDirectory() as tmp, patch.object(cli.transport,'run_json') as run, \
              contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(['--host','frame','record','--fetch',tmp]),1)
+            self.assertEqual(cli.main(['--host','frame','record','--view','stereo','--fps','5','--fetch',tmp]),1)
             run.assert_not_called()
 
     def test_fetch_validates_media_and_uses_strict_ssh(self):
