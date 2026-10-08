@@ -3,6 +3,8 @@ import argparse
 import base64
 import json
 import logging
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15,7 +17,7 @@ import anyio
 import jsonschema
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, ResourceLink, TextContent
 from pydantic import Field
 
 from . import controller_inputs, transport
@@ -119,12 +121,48 @@ def capture_result(data, directory, remote):
     return reply
 
 
+def recording_result(data, directory, remote):
+    reply = result(data)
+    files = data.get('local_files' if remote else 'files')
+    if not isinstance(files, dict) or directory.resolve() != directory:
+        raise ValueError('record returned unsafe or missing artifact paths')
+    # Pin the output directory and refuse symlinks at open time. Nonblocking opens
+    # allow fstat to reject FIFOs without waiting for another process to write.
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name, mime, limit in [('recording.mp4', 'video/mp4', 512 * 1024 * 1024),
+                                  ('timeline.json', 'application/json', 8 * 1024 * 1024)]:
+            expected = directory / name
+            if files.get(name) != str(expected):
+                raise ValueError(f'record returned an unsafe or missing path for {name}')
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                    raise ValueError(f'record {name} must be a regular file at most {limit} bytes')
+                if name == 'recording.mp4':
+                    header = stream.read(16)
+                    if len(header) < 16 or header[4:8] != b'ftyp':
+                        raise ValueError('record recording.mp4 is not MP4')
+                else:
+                    timeline = stream.read(limit + 1)
+                    if len(timeline) > limit:
+                        raise ValueError('record timeline.json exceeds 8 MiB limit')
+                    json.loads(timeline)
+            reply.content.append(ResourceLink(type='resource_link', name=name, uri=expected.as_uri(),
+                                              mimeType=mime, size=info.st_size))
+    finally:
+        os.close(directory_fd)
+    return reply
+
+
 def create_server(config: Config, *, runner=run_cli):
     if config.host:
         transport.remote_argv(config.host, config.remote_root, [])
     prefix = ['--host', config.host, '--remote-root', config.remote_root] if config.host else []
     server = BenchMCP('frame-testbench')
     lock = anyio.Lock()
+    recording_lock = anyio.Lock()
 
     async def execute(arguments) -> CallToolResult:
         async with lock:
@@ -242,6 +280,26 @@ def create_server(config: Config, *, runner=run_cli):
             data = await anyio.to_thread.run_sync(runner, arguments, abandon_on_cancel=False)
             return await anyio.to_thread.run_sync(
                 capture_result, data, directory, bool(config.host), abandon_on_cancel=False)
+
+    @server.tool()
+    async def record(duration_seconds: Annotated[int, Field(strict=True, ge=1, le=60)] = 10,
+                     fps: Annotated[int, Field(strict=True, ge=1, le=10)] = 5,
+                     view: Literal['preview', 'stereo'] = 'stereo') -> CallToolResult:
+        """Record sampled compositor screenshots as MP4 and timeline file links.
+
+        Not a real-time compositor mirror. Pose/input tools remain available during recording.
+        """
+        async with recording_lock:
+            parent = config.artifacts_dir.expanduser().resolve()
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix='record-', dir=parent)) / 'recording'
+            arguments = prefix + ['record', '--duration', str(duration_seconds), '--fps', str(fps),
+                                  '--view', view, '--fetch' if config.host else '--output', str(directory)]
+            # Shield the worker and keep its lock until the bounded CLI operation
+            # finishes, even if the MCP caller cancels. Controls use a different lock.
+            data = await anyio.to_thread.run_sync(runner, arguments, abandon_on_cancel=False)
+            return await anyio.to_thread.run_sync(
+                recording_result, data, directory, bool(config.host), abandon_on_cancel=False)
 
     @server.tool()
     async def release_all() -> CallToolResult:

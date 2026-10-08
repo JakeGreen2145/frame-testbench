@@ -34,7 +34,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
             'controller_pose_set', 'controller_pose_move', 'controller_pose_reset',
             'controller_button', 'controller_trigger', 'controller_grip', 'controller_thumbstick',
             'controller_touch', 'controller_inputs_reset', 'controller_input_status',
-            'compositor', 'capture', 'release_all'})
+            'compositor', 'capture', 'record', 'release_all'})
         for tool in tools:
             self.assertFalse(tool.inputSchema.get('additionalProperties', True))
             self.assertFalse({'host', 'socket', 'command', 'output', 'remote_root'} &

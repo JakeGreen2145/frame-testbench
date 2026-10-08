@@ -72,9 +72,9 @@ Generic MCP client configuration:
 ```
 
 Omit `--host` and `--remote-root` for local use. For clients that provide a tool
-call timeout, allow at least 450 seconds for capture and leave additional time
-when queueing calls. The server's CLI subprocess timeout is 420 seconds, covering
-the CLI's separately bounded status, capture, and fetch operations.
+call timeout, allow at least 450 seconds for capture or recording and leave
+additional time when queueing calls. The server's CLI subprocess timeout is
+420 seconds, covering the CLI's bounded backend and fetch operations.
 
 You can also launch `.venv/bin/python -m frame_testbench.mcp_server`, or use the
 checkout launcher `.venv/bin/python /path/to/frame-testbench/frame-testbench-mcp`.
@@ -101,6 +101,7 @@ An editable install makes the module available regardless of working directory.
 | `controller_input_status` | None | `inputs`, independent SteamVR action readback |
 | `compositor` | `mode`: `awake` or `auto` | `compositor MODE` |
 | `capture` | None | `capture` with a server-owned output/fetch directory |
+| `record` | Optional `duration_seconds`, `fps`, `view` | `record --duration N --fps N --view VIEW` with a server-owned output/fetch directory |
 | `release_all` | None | `release` |
 
 `side` is `left` or `right`. Position and translation are three-element XYZ
@@ -180,7 +181,26 @@ It leaves the compositor policy unchanged. Physical controller tracking is never
 `compositor` with `{"mode":"auto"}` separately to restore automatic standby.
 Do not apply virtual tracking overrides while someone relies on normal tracking.
 
-## Results and capture files
+### Recording
+
+Call `record` with no arguments for 10 seconds at a requested 5 fps in stereo,
+or supply strict integer `duration_seconds` from 1 to 60 and `fps` from 1 to 10.
+Booleans, strings, fractional numbers, and integer-valued floats are rejected.
+`view` is `stereo` by default or `preview`. For example:
+
+```json
+{"duration_seconds": 10, "fps": 5, "view": "stereo"}
+```
+
+The recording samples compositor screenshots and encodes an MP4. This is not a
+real-time compositor mirror or headset-refresh-rate video. The public GL mirror
+is unavailable on Steam Frame. Requested sampling rates do not guarantee actual
+capture rates; inspect the returned recording metadata and `timeline.json`.
+
+Pose and controller input calls can run while a recording is active. The client
+must issue those calls concurrently rather than waiting for `record` to return.
+
+## Results and artifact files
 
 Successful tools return the actual CLI JSON as both a text content block and
 `structuredContent`. Normal CLI failures and input validation errors return MCP
@@ -201,9 +221,26 @@ PNG signatures, and limits each returned image to 32 MiB. The native observer is
 responsible for validating complete capture files. Oversized images fail instead
 of being silently resized or omitted.
 
-Captures, including partial failed captures, remain on disk for diagnosis. There
-is no automatic retention policy. Delete old captures when no call is using
-them, and treat screenshots as potentially sensitive.
+`record` returns the CLI JSON plus official MCP `resource_link` blocks for
+`recording.mp4` with MIME type `video/mp4` and `timeline.json` with MIME type
+`application/json`. Videos are not embedded as base64. Each recording gets a new
+private `record-*/recording/` destination under `--artifacts-dir`; the final child
+is absent until the CLI creates it. Local calls use `--output`, and remote calls
+use `--fetch` and validate only the fetched `local_files`.
+
+Links use local `file://` URIs on the MCP server machine. The client needs access
+to that filesystem and support for resource links to open them. These files are
+not exposed through an HTTP server or an MCP resource-read endpoint.
+
+The server checks backend success before returning links, requires exact owned
+paths, refuses symlinks and nonregular files, limits MP4 files to 512 MiB, and
+checks a bounded 16-byte header for the MP4 `ftyp` signature without reading the
+whole video. It parses the timeline as JSON with an 8 MiB limit. These checks do
+not establish complete video decodability; the CLI and encoder produce the video.
+
+Artifacts, including partial failed captures and recordings, remain on disk for
+diagnosis. There is no automatic retention policy. Delete old artifacts when no
+call is using them, and treat screenshots and recordings as potentially sensitive.
 
 ## Execution boundaries
 
@@ -213,10 +250,12 @@ them, and treat screenshots as potentially sensitive.
   numbers before the CLI subprocess starts.
 - Commands use literal argv, never a local shell. The existing CLI handles SSH
   quoting and backend validation.
-- One server serializes all operations, including moves and captures. A cancelled
-  MCP request holds the lock until its already-started backend operation finishes.
-  Cancellation is not rollback. Separate servers or direct CLI calls are not
-  coordinated by this lock; use one writer for a target.
+- One server serializes controls and captures through one lock. Recordings use a
+  separate lock, so only one recording runs per server while controls can proceed.
+  A cancelled MCP request retains its shielded worker and lock until the already
+  started, bounded CLI operation finishes. Cancellation is not rollback. These
+  locks do not coordinate separate servers or direct CLI processes; use one
+  control writer for a target.
 - Stdout carries MCP JSON-RPC only. Diagnostics go to stderr. Backend stdout is
   captured and parsed as JSON, never forwarded directly to the client stream.
 - Existing CLI environment overrides such as `FRAME_TESTBENCH_SOCKET` and
@@ -238,8 +277,11 @@ Do not count a skipped MCP suite as MCP verification. No hardware or SSH connect
 is needed. Tests use an explicitly identified CPU-only observer fixture and a
 real SDK client/server subprocess to exercise initialize, list-tools, tool calls,
 backend errors, validation, PNG byte content, metadata, and stderr separation.
-Unit tests also check CLI argv, fixed remote configuration, concurrency, and
-cancellation. Existing native tests build and exercise their own CPU-only OpenVR
+Recording tests use explicitly synthetic MP4 headers, not playable videos or
+hardware evidence. A real SDK stdio round trip verifies resource links and
+metadata with a synthetic CLI runner. Unit tests check local/remote argv, unsafe
+paths, size limits, bounded header reads, concurrent controls, and cancellation.
+Existing native tests build and exercise their own CPU-only OpenVR
 boundary. Live headset verification is a separate step.
 
 License: MIT, matching the repository's `LICENSE`.

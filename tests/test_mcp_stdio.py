@@ -70,7 +70,7 @@ else:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, 'frame-testbench')
                     tools = await client.list_tools()
-                    self.assertEqual(len(tools.tools), 18)
+                    self.assertEqual(len(tools.tools), 19)
                     inputs = await client.call_tool('controller_input_status', {})
                     self.assertFalse(inputs.isError, inputs)
                     self.assertTrue(inputs.structuredContent['fixture_input_readback'])
@@ -95,6 +95,40 @@ else:
                     self.assertEqual([base64.b64decode(c.data) for c in capture.content if c.type == 'image'], [PNG, PNG])
         self.assertIn('fixture observer diagnostic', log.read_text())
         self.assertNotIn('Failed to parse JSONRPC', log.read_text())
+
+    async def test_recording_links_round_trip_over_real_sdk_stdio(self):
+        """Real SDK transport with synthetic runner artifacts, not video/hardware validation."""
+        import anyio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        from test_mcp_record import MP4_HEADER
+        code = '''
+import sys
+from pathlib import Path
+from frame_testbench.mcp_server import Config, create_server
+from test_mcp_record import recording_fixture
+create_server(Config(artifacts_dir=Path(sys.argv[1])), runner=recording_fixture).run(transport='stdio')
+'''
+        env = dict(self.env, PYTHONPATH=os.pathsep.join([str(ROOT), str(ROOT / 'tests')]))
+        params = StdioServerParameters(command=sys.executable,
+            args=['-c', code, str(self.directory / 'recordings')], env=env, cwd=str(self.directory))
+        with anyio.fail_after(20):
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    reply = await client.call_tool('record', {'duration_seconds': 1, 'fps': 1, 'view': 'preview'})
+                    self.assertFalse(reply.isError, reply)
+                    self.assertTrue(reply.structuredContent['recording']['synthetic_fixture'])
+                    links = {c.name: c for c in reply.content if c.type == 'resource_link'}
+                    self.assertEqual(set(links), {'recording.mp4', 'timeline.json'})
+                    for name, link in links.items():
+                        path = Path(reply.structuredContent['files'][name])
+                        self.assertEqual(str(link.uri), path.as_uri())
+                    self.assertEqual(links['recording.mp4'].mimeType, 'video/mp4')
+                    self.assertEqual(Path(reply.structuredContent['files']['recording.mp4']).read_bytes(), MP4_HEADER)
+                    for invalid in [{'fps': True}, {'duration_seconds': 1.0}, {'view': 'both'}]:
+                        refused = await client.call_tool('record', invalid)
+                        self.assertTrue(refused.isError, refused)
 
     async def test_cli_failure_does_not_leak_to_stdout(self):
         try:
