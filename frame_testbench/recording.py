@@ -1,4 +1,4 @@
-"""Bounded sampled-compositor recordings. FFmpeg is needed only on the capture host."""
+"""Bounded recordings: continuous HeadsetView or explicit sampled screenshots."""
 import json
 import math
 from pathlib import Path
@@ -13,10 +13,11 @@ FILES = ('recording.mp4', 'timeline.json')
 def validate(duration, fps, view):
     if type(duration) is not int or not 1 <= duration <= 60:
         raise ValueError('record duration must be an integer from 1 to 60 seconds')
-    if type(fps) is not int or not 1 <= fps <= 10:
-        raise ValueError('record fps must be an integer from 1 to 10')
-    if view not in ('preview', 'stereo'):
-        raise ValueError('record view must be preview or stereo')
+    if view not in ('headset', 'preview', 'stereo'):
+        raise ValueError('record view must be headset, preview or stereo')
+    maximum_fps = 60 if view == 'headset' else 10
+    if type(fps) is not int or not 1 <= fps <= maximum_fps:
+        raise ValueError(f'record fps must be an integer from 1 to {maximum_fps}')
 
 
 def media_file(path):
@@ -53,6 +54,9 @@ def record(output, duration, fps, view, native):
     directory = Path(output).absolute()
     if directory.exists() or directory.is_symlink():
         raise FileExistsError('record output already exists; use a fresh directory')
+    if view == 'headset':
+        from . import headset_recording
+        return headset_recording.record(directory, duration, fps, native)
     ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
     if not ffmpeg or not ffprobe:
         raise RuntimeError('record requires ffmpeg and ffprobe on the capture host')
