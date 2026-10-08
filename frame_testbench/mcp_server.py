@@ -88,7 +88,7 @@ def run_cli(arguments):
     """Invoke the installed CLI module without relying on PATH or the current directory."""
     completed = subprocess.run(
         [sys.executable, '-c', 'from frame_testbench.cli import main; raise SystemExit(main())', *arguments],
-        capture_output=True, text=True, timeout=420, check=False)
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=420, check=False)
     if completed.stderr:
         print(completed.stderr, end='', file=sys.stderr)
     try:

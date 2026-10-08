@@ -1,13 +1,15 @@
 # Frame Testbench
 
-Headset and controller pose tools for closed-loop development on Steam Frame. A Python CLI and stdio MCP server drive native OpenVR adapters locally or over SSH. CLI commands return JSON; MCP captures also return image content for agent vision. This is not a replacement compositor.
+Headset and controller input tools for closed-loop development on Steam Frame. A Python CLI and stdio MCP server drive native OpenVR adapters locally or over SSH. CLI commands return JSON; MCP captures also return image content for agent vision. This is not a replacement compositor.
 
 ## What it controls
 
 - The real HMD's worn/unworn proximity input.
 - The real HMD's translation and rotation, including valid synthetic tracking while physical tracking is unavailable.
 - Independent left/right synthetic controller translation and rotation, without requiring powered physical controllers.
+- Frame-profile buttons, touches, trigger/grip values, and thumbstick axes.
 - SteamVR stereo screenshots, with runtime pose/frame metadata and optional downloads to the agent machine.
+- Sampled compositor video recordings with measured timing, H.264 MP4 output, and SSH downloads.
 
 Input overrides stay active across CLI calls. `release` restores physical input. There is no per-screenshot activation/rollback cycle. Do not wear the headset while another person or agent is driving its pose.
 
@@ -103,6 +105,15 @@ ssh frame 'cd dev/frame-testbench && make'
 
 For an agent, the loop is: set input, read `status`, capture, inspect `local_files["stereo.png"]`, change code, repeat. A successful input command acknowledges the proxy state. Check runtime pose and activity in `status` for downstream behavior. A successful screenshot verifies complete PNG containers, not correct application rendering.
 
+## Video recording
+
+```sh
+./frame-testbench --host frame record --duration 10 --fps 5 --view stereo \
+  --fetch artifacts/video-test
+```
+
+The MCP `record` tool takes `duration_seconds`, `fps`, and `view`, and returns video/timeline file links. Input tools can run concurrently. FFmpeg with libx264 and ffprobe are required on the capture host only. This is a sampled screenshot recording, not headset-rate video. Measured sample intervals are preserved rather than compressed to the requested FPS. See [recording behavior, timing, and limits](docs/recording.md).
+
 ## Capture limits
 
 The output is SteamVR's public stereo screenshot, not a desktop screenshot. It can include compositor overlays but has cropped field of view and is not a full optical lens image. Camera-layer inclusion must be verified for the application being tested. A virtual pose does not move physical cameras or validate passthrough motion alignment.
@@ -128,12 +139,12 @@ This leaves the stock runtime and its driver files untouched. The proxy starts w
 
 ## Native commands
 
-`build/frame-observe` provides `status`, `capture ABS_NEW_DIRECTORY`, `setting true|false`, and `debug DEVICE_INDEX REQUEST`. It uses Background OpenVR initialization and emits JSON on stdout; SDK chatter goes to stderr. `OPENVR_API_LIBRARY` selects another runtime library. `FRAME_OBSERVE_TIMEOUT_SECONDS` bounds a command from 1 to 120 seconds, default 20.
+`build/frame-observe` provides `status`, `inputs ABS_MANIFEST_PATH`, `capture ABS_NEW_DIRECTORY`, `record ABS_NEW_DIRECTORY DURATION_SECONDS FPS`, `setting true|false`, and `debug DEVICE_INDEX REQUEST`. It uses Background OpenVR initialization and emits JSON on stdout; SDK chatter goes to stderr. `OPENVR_API_LIBRARY` selects another runtime library. `FRAME_OBSERVE_TIMEOUT_SECONDS` bounds a command from 1 to 120 seconds, default 20, or recording duration plus 20 for `record`.
 
 `FRAME_TESTBENCH_OBSERVER` selects a different observer executable. `FRAME_TESTBENCH_SOCKET` selects the local input socket, normally `/run/user/<uid>/frame-testbench.sock`. Input control uses a user-only UNIX socket. There is no listening network service.
 
 ## Verification
 
-`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md), [controller/MCP validation](docs/controller-mcp-validation.md), and [button/analog/touch validation](docs/input-validation.md).
+`make test` builds and exercises the public SDK boundaries with fake runtimes, checks pose mathematics and the CLI, and tests input forwarding and loader selection without starting SteamVR. With `.[mcp]` installed in the active Python environment, it also exercises the actual stdio MCP protocol. These tests do not substitute for the live headset checks in the [original HMD validation](docs/validation.md), [controller/MCP validation](docs/controller-mcp-validation.md), [button/analog/touch validation](docs/input-validation.md), and [recording validation](docs/recording-validation.md).
 
 OpenVR headers retain Valve's license under `vendor/`. The remaining project code is MIT licensed.

@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
-from . import controller_inputs, install, pose, transport
+from . import controller_inputs, install, pose, recording, transport
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,6 +22,11 @@ class Bench:
     def native(self, *arguments):
         binary = os.environ.get('FRAME_TESTBENCH_OBSERVER', str(ROOT / 'build/frame-observe'))
         return transport.run_json([binary, *map(str, arguments)], timeout=125)
+
+    def record(self, output, duration, fps, view):
+        recording.validate(duration, fps, view)
+        directory = Path(output).absolute() if output else ROOT / "artifacts" / ("record-" + uuid.uuid4().hex)
+        return recording.record(directory, duration, fps, view, self.native)
 
     def capture(self, output):
         if output:
@@ -109,6 +114,12 @@ def parser():
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
     capture.add_argument('--fetch', help='with --host, download PNGs into this new local directory')
+    record = commands.add_parser('record', help='sample compositor screenshots into a timed H.264 MP4; no audio')
+    record.add_argument('--duration', type=int, default=10, help='recording window in seconds, 1..60')
+    record.add_argument('--fps', type=int, default=5, help='requested sampling rate, 1..10; actual rate may be lower')
+    record.add_argument('--view', choices=('preview', 'stereo'), default='stereo')
+    record.add_argument('--output', help='fresh output directory on capture host')
+    record.add_argument('--fetch', help='with --host, fetch video and timeline into a fresh local directory')
     for name in ('install', 'uninstall'):
         p = commands.add_parser(name, help='change only the SteamVR user service override')
         p.add_argument('--restart', action='store_true', help='restart SteamVR now; interrupts VR')
@@ -163,6 +174,9 @@ def dispatch(args, bench):
         values = desired['position'] + desired['quaternion']
         command = 'controller-pose ' + args.side if controller else 'pose'
         return bench.control(command + ' ' + ' '.join(format(v, '.17g') for v in values))
+    if args.command == 'record':
+        recording.validate(args.duration, args.fps, args.view)
+        return bench.record(args.output, args.duration, args.fps, args.view)
     if args.command == 'capture':
         return bench.capture(args.output)
     if args.command in ('install', 'uninstall'):
@@ -180,6 +194,10 @@ def main(argv=None):
     args = parser().parse_args(arguments)
     try:
         controller_inputs.command(args)  # validate inputs before local or SSH I/O
+        if args.command == 'record':
+            recording.validate(args.duration, args.fps, args.view)
+            if args.fetch and (Path(args.fetch).exists() or Path(args.fetch).is_symlink()):
+                raise FileExistsError('record fetch output already exists; use a fresh directory')
         if args.host:
             # Remove only the transport options; preserve arguments and literal values.
             forwarded = []
@@ -194,11 +212,13 @@ def main(argv=None):
                     continue
                 forwarded.append(item)
                 i += 1
-            result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=110)
+            result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=300 if args.command == 'record' else 110)
             if args.command == 'capture' and args.fetch:
                 result = fetch_capture(args.host, result, args.fetch)
+            if args.command == 'record' and args.fetch:
+                result = recording.fetch(args.host, result, args.fetch)
         else:
-            if args.command == 'capture' and args.fetch:
+            if args.command in ('capture', 'record') and args.fetch:
                 raise ValueError('--fetch requires --host; use --output for local capture')
             result = dispatch(args, Bench(args.socket))
         print(json.dumps(result, indent=2, allow_nan=False))

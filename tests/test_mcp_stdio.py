@@ -130,6 +130,21 @@ create_server(Config(artifacts_dir=Path(sys.argv[1])), runner=recording_fixture)
                         refused = await client.call_tool('record', invalid)
                         self.assertTrue(refused.isError, refused)
 
+    async def test_cli_child_cannot_consume_mcp_protocol_stdin(self):
+        observer = self.directory / 'stdin-observer'
+        observer.write_text(f'''#!{sys.executable}
+import json, os
+print(json.dumps({{"ok": True, "inherited_input": os.read(0, 64).decode()}}))
+''')
+        observer.chmod(0o700)
+        env = dict(self.env, FRAME_TESTBENCH_OBSERVER=str(observer))
+        result = subprocess.run([sys.executable, '-c',
+            'import json; from frame_testbench.mcp_server import run_cli; print(json.dumps(run_cli(["inputs"])))'],
+            input='MCP_PROTOCOL_MUST_NOT_REACH_CHILD', text=True, capture_output=True, env=env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        self.assertEqual(json.loads(result.stdout)['inherited_input'], '')
+
     async def test_cli_failure_does_not_leak_to_stdout(self):
         try:
             from frame_testbench import mcp_server
