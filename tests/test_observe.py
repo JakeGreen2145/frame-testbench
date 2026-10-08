@@ -138,21 +138,36 @@ def fake_source():
         'SetBool': '''check_setting(pchSection,pchSettingsKey); log(bValue?"set_true":"set_false");
             if(peError) *peError=mode("write_error")?VRSettingsError_WriteFailed:VRSettingsError_None;
             setting=bValue;''',
-        'RequestScreenshot': '''if(type!=VRScreenshotType_Stereo) abort(); log("request_screenshot");
-            if(mode("screenshot_error")) return VRScreenshotError_RequestFailed;
+        'RequestScreenshot': '''if(type!=VRScreenshotType_Stereo) abort();
+            // Fail concurrent submissions instead of hiding them with a join.
+            if(worker.joinable()) {if(!worker_complete) abort(); worker.join();}
+            log("request_screenshot"); ++requests;
+            if(mode("screenshot_error") || mode("record_max_alarm") || (mode("second_error") && requests==2) ||
+                    (mode("third_error") && requests==3)) return VRScreenshotError_RequestFailed;
+            if((mode("second_hang") && requests==2) || (mode("third_hang") && requests==3))
+                for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));
             *pOutScreenshotHandle=77;
             // Steam Frame's compositor appends .png to API filename prefixes.
             std::string a=std::string(pchPreviewFilename)+".png",b=std::string(pchVRFilename)+".png";
-            worker=std::thread([a,b]{
+            unsigned request= requests; worker_complete=false;
+            worker=std::thread([a,b,request]{
                 auto bytes=image;
-                if(mode("corrupt")) bytes[45]^=1;
+                if(mode("corrupt") || (mode("second_corrupt") && request==2)) bytes[45]^=1;
                 std::ofstream f(a,std::ios::binary); f.write((char*)bytes.data(),33); f.flush();
-                if(mode("incomplete")) return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                if(mode("incomplete") || (mode("second_incomplete") && request==2)) return;
+                int first_delay=300, second_delay=200;
+                if(mode("fast") || mode("record_alarm") || mode("second_error") || mode("second_hang") ||
+                        mode("second_corrupt") || mode("second_incomplete") ||
+                        mode("third_error") || mode("third_hang")) first_delay=second_delay=5;
+                if(mode("slow_first")) {first_delay=request==1?650:5; second_delay=5;}
+                if(mode("past_duration")) {first_delay=1150; second_delay=5;}
+                std::this_thread::sleep_for(std::chrono::milliseconds(first_delay));
                 f.write((char*)bytes.data()+33,bytes.size()-33); f.close();
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                std::ofstream g(b,std::ios::binary); g.write((char*)bytes.data(),bytes.size()); g.close();
-                log("pngs_complete");
+                std::this_thread::sleep_for(std::chrono::milliseconds(second_delay));
+                std::ofstream g(b,std::ios::binary); g.write((char*)bytes.data(),bytes.size());
+                // Mark the worker finished before publishing IEND via close, so
+                // observing both complete files cannot race the fixture's flag.
+                log("pngs_complete"); worker_complete=true; g.close();
             }); return VRScreenshotError_None;''',
         'DriverDebugRequest': '''log("debug");
             if(unDeviceIndex!=3 || std::string(pchRequest)!="test request") abort();
@@ -170,7 +185,11 @@ def fake_source():
 #include <vector>
 #include <cstdio>
 #include <limits>
+#include <atomic>
+#include <unistd.h>
 using namespace vr;
+std::atomic<bool> worker_complete{true};
+unsigned requests=0;
 bool setting=true;
 bool manifest_set=false;
 unsigned updates=0;
@@ -209,6 +228,8 @@ HmdMatrix34_t matrix(float x){HmdMatrix34_t m={};for(int i=0;i<3;i++)m.m[i][i]=1
     source += '''extern "C" {
 uint32_t VR_InitInternal2(EVRInitError *e,EVRApplicationType t,const char*){
  if(t!=VRApplication_Background) abort(); log("init_background"); printf("sdk noise\\n"); fflush(stdout);
+ if(mode("record_alarm") || mode("record_max_alarm")){
+     auto remaining=alarm(0);log(("timeout "+std::to_string(remaining)).c_str());alarm(remaining);}
  if(mode("hang")) for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));
  *e=mode("init_error")?VRInitError_Init_HmdNotFound:VRInitError_None;return 1;
 }
@@ -521,6 +542,192 @@ class ObserveTests(unittest.TestCase):
         for mode in ('write_error', 'read_error', 'mismatch'):
             self.run_observe('setting', 'false', ok=False, mode=mode)
         self.run_observe('status', ok=False, mode='read_error')
+
+    def test_record_cli_validation_happens_before_sdk(self):
+        destination = self.path / 'new'
+        for args, error in [
+                (('record', destination, '0', '1'), 'integer'),
+                (('record', destination, '61', '1'), 'integer'),
+                (('record', destination, '1', '0'), 'integer'),
+                (('record', destination, '1', '11'), 'integer'),
+                (('record', destination, '1.5', '2'), 'integer'),
+                (('record', destination, '2', '-1'), 'integer'),
+                (('record', destination, '99999999999999999999', '1'), 'integer'),
+                (('record', 'relative', '1', '1'), 'absolute'),
+                (('record', destination, '1'), 'usage'),
+                (('record', destination, '1', '1', 'extra'), 'usage')]:
+            with self.subTest(args=args):
+                self.assertIn(error, self.run_observe(*args, ok=False)['error'])
+                self.assertFalse(destination.exists())
+                self.assertEqual(self.calls(), [])
+
+    def test_record_refuses_existing_outputs_without_overwrite(self):
+        regular = self.path / 'file'
+        regular.write_text('keep')
+        link = self.path / 'link'
+        link.symlink_to(self.path / 'missing')
+        for destination in (self.path, regular, link):
+            self.assertIn('already exists', self.run_observe('record', destination, 1, 2, ok=False)['error'])
+        self.assertEqual(regular.read_text(), 'keep')
+        self.assertEqual(self.calls(), [])
+
+    def test_record_one_session_multiple_complete_samples_with_elapsed_timestamps(self):
+        destination = self.path / 'new'
+        start = time.monotonic()
+        data = self.run_observe('record', destination, 2, 10)
+        wall = time.monotonic() - start
+        self.assertEqual(data['command'], 'record')
+        self.assertEqual(data['source'], 'openvr_screenshots')
+        self.assertEqual(data['requested_duration_seconds'], 2)
+        self.assertEqual(data['requested_fps'], 10)
+        self.assertEqual(data['capture_scope'],
+                         'sampled OpenVR stereo screenshots, cropped view; not headset-rate video or full lens output')
+        frames = data['frames']
+        self.assertGreaterEqual(len(frames), 2)
+        self.assertLessEqual(len(frames), 4, 'slow screenshots must skip missed slots')
+        self.assertGreaterEqual(data['elapsed_seconds'], 2)
+        self.assertLessEqual(data['elapsed_seconds'], wall)
+        for index, frame in enumerate(frames):
+            self.assertEqual(frame['index'], index)
+            self.assertGreaterEqual(frame['request_seconds'], 0)
+            self.assertLess(frame['request_seconds'], 2)
+            self.assertGreaterEqual(frame['completed_seconds'] - frame['request_seconds'], .45)
+            self.assertLessEqual(frame['completed_seconds'], data['elapsed_seconds'])
+            if index:
+                self.assertGreater(frame['request_seconds'], frames[index - 1]['completed_seconds'])
+            for key in ('preview', 'stereo'):
+                path = Path(frame[key])
+                self.assertEqual(path, destination / f'frame-{index:06d}' / f'{key}.png')
+                self.assertEqual(path.read_bytes(), png())
+        calls = self.calls()
+        self.assertEqual(calls.count('init_background'), 1)
+        self.assertEqual(calls.count('shutdown'), 1)
+        self.assertEqual(calls.count('request_screenshot'), len(frames))
+        self.assertEqual([c for c in calls if c in ('request_screenshot', 'pngs_complete')],
+                         ['request_screenshot', 'pngs_complete'] * len(frames))
+        self.assertLess(max(i for i, c in enumerate(calls) if c == 'pngs_complete'), calls.index('shutdown_enter'))
+        self.assertFalse(any(c.startswith('set_') for c in calls))
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
+    def test_record_fast_samples_are_paced_not_a_capture_count_loop(self):
+        data = self.run_observe('record', self.path / 'paced', 1, 5, mode='fast')
+        frames = data['frames']
+        self.assertGreaterEqual(len(frames), 2)
+        self.assertLessEqual(len(frames), 5)
+        self.assertGreaterEqual(data['elapsed_seconds'], 1)
+        for before, after in zip(frames, frames[1:]):
+            self.assertGreaterEqual(after['request_seconds'] - before['request_seconds'], .17)
+        self.assertLess(frames[-1]['request_seconds'], 1)
+
+    def test_record_skips_missed_slots_without_catchup_bursts(self):
+        data = self.run_observe('record', self.path / 'skip', 2, 5, mode='slow_first')
+        frames = data['frames']
+        self.assertGreaterEqual(len(frames), 2)
+        self.assertLessEqual(len(frames), 7)
+        self.assertGreaterEqual(frames[0]['completed_seconds'], .65)
+        self.assertGreaterEqual(frames[1]['request_seconds'], .79)
+        for before, after in zip(frames, frames[1:]):
+            self.assertGreaterEqual(after['request_seconds'] - before['request_seconds'], .17)
+
+    def test_record_requires_two_frames_and_never_submits_past_duration(self):
+        for mode, fps in [('fast', 1), ('past_duration', 10)]:
+            self.log.unlink(missing_ok=True)
+            data = self.run_observe('record', self.path / mode, 1, fps, ok=False, mode=mode)
+            self.assertIn('at least two', data['error'])
+            self.assertEqual(self.calls().count('request_screenshot'), 1)
+            self.assertEqual((self.path / mode / 'frame-000000/stereo.png').read_bytes(), png())
+
+    def test_record_partial_failures_are_errors_and_keep_completed_artifacts(self):
+        self.env['FRAME_OBSERVE_TIMEOUT_SECONDS'] = '2'
+        for mode in ('second_error', 'second_hang', 'second_corrupt', 'second_incomplete', 'third_error', 'third_hang'):
+            with self.subTest(mode=mode):
+                self.log.unlink(missing_ok=True)
+                destination = self.path / mode
+                data = self.run_observe('record', destination, 1, 5, ok=False, mode=mode)
+                self.assertIn('RequestScreenshot' if mode.endswith('_error') else 'timed out', data['error'])
+                count = 3 if mode.startswith('third_') else 2
+                self.assertEqual(self.calls().count('request_screenshot'), count)
+                for index in range(count - 1):
+                    for key in ('preview', 'stereo'):
+                        self.assertEqual((destination / f'frame-{index:06d}' / f'{key}.png').read_bytes(), png())
+                self.assertTrue((destination / f'frame-{count - 1:06d}').is_dir())
+                self.assertFalse((destination / f'frame-{count:06d}').exists())
+
+    def test_record_timeout_default_is_duration_plus_twenty_and_override_is_respected(self):
+        self.env.pop('FRAME_OBSERVE_TIMEOUT_SECONDS')
+        self.run_observe('record', self.path / 'default', 1, 5, mode='record_alarm')
+        self.assertIn('timeout 21', self.calls())
+        self.log.unlink()
+        self.run_observe('record', self.path / 'maximum', 60, 10, ok=False, mode='record_max_alarm')
+        self.assertIn('timeout 80', self.calls())
+        self.assertEqual(self.calls().count('request_screenshot'), 1)
+        self.log.unlink()
+        self.env['FRAME_OBSERVE_TIMEOUT_SECONDS'] = '2'
+        self.run_observe('record', self.path / 'override', 1, 5, mode='record_alarm')
+        self.assertIn('timeout 2', self.calls())
+        self.log.unlink()
+        self.env['FRAME_OBSERVE_TIMEOUT_SECONDS'] = '121'
+        self.assertIn('integer', self.run_observe('record', self.path / 'invalid', 1, 5, ok=False)['error'])
+        self.assertEqual(self.calls(), [])
+
+    def test_record_limits_default_and_scaled_real_capture_boundary(self):
+        # Exercise the actual recorder/PNG checks with small internal limits,
+        # not 512 MiB of fixtures or a minute-long CI test. CLI limits are fixed.
+        source = self.path / 'record_probe.cpp'
+        source.write_text('#define main observe_cli_main\n#include "' + str(ROOT / 'native/observe.cpp') + '"\n'
+                          '#undef main\n' + r'''
+int main(int argc, char **argv) {
+    if (argc == 1) {
+        const RecordLimits limits;
+        std::cout << limits.max_bytes << " " << limits.max_frames << "\n";
+        return 0;
+    }
+    output_fd = dup(STDOUT_FILENO);
+    dup2(STDERR_FILENO, STDOUT_FILENO);
+    alarm(5);
+    try {
+        std::string result;
+        {
+            Sdk sdk;
+            result = record(sdk, argv[1], 1, 10, {std::stoull(argv[2]), std::stoull(argv[3])});
+        }
+        emit(result);
+        return 0;
+    } catch (const std::exception &error) {
+        emit("{\"ok\":false,\"error\":" + quote(error.what()) + '}');
+        return 1;
+    }
+}
+''')
+        binary = self.path / 'record_probe'
+        built = subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-O2', '-Wall', '-Wextra',
+                                '-Werror', str(source), '-ldl', '-pthread', '-o', str(binary)],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        defaults = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+        self.assertEqual(defaults.stdout.strip(), f'{512 * 1024 * 1024} 600')
+        self.env['FAKE_MODE'] = 'fast'
+        for name, budget, limit, ok, count in [
+                ('exact', 4 * len(png()), 2, True, 2),
+                ('count', 512 * 1024 * 1024, 2, True, 2),
+                ('bytes', 4 * len(png()) - 1, 600, False, 2)]:
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                destination = self.path / name
+                result = subprocess.run([str(binary), str(destination), str(budget), str(limit)],
+                                        env=self.env, capture_output=True, text=True, timeout=6)
+                self.assertEqual(result.returncode == 0, ok, (result.stdout, result.stderr))
+                data = json.loads(result.stdout)
+                self.assertEqual(data['ok'], ok)
+                self.assertEqual(self.calls().count('request_screenshot'), count)
+                self.assertFalse((destination / 'frame-000002').exists())
+                self.assertEqual((destination / 'frame-000000/stereo.png').read_bytes(), png())
+                if ok:
+                    self.assertEqual(len(data['frames']), 2)
+                    self.assertGreaterEqual(data['elapsed_seconds'], 1)
+                else:
+                    self.assertIn('byte limit', data['error'])
+                    self.assertTrue((destination / 'frame-000001').is_dir())
 
     def test_capture_refuses_existing_directory_file_and_symlink(self):
         for p in (self.path, self.path / 'file', self.path / 'link'):

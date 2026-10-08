@@ -389,14 +389,24 @@ bool complete_png(const fs::path &path) {
     }
 }
 
-std::string capture(Sdk &sdk, const fs::path &directory) {
-    auto *screenshots = sdk.get<vr::IVRScreenshots>(vr::IVRScreenshots_Version);
+using Clock = std::chrono::steady_clock;
+struct Screenshot {
+    vr::ScreenshotHandle_t handle = vr::k_unScreenshotHandleInvalid;
+    std::string preview, stereo;
+    Clock::time_point requested, completed;
+};
+
+Screenshot capture_files(vr::IVRScreenshots *screenshots, const fs::path &directory,
+                         Clock::time_point latest_request = Clock::time_point::max()) {
     // Atomic mkdir is the final no-overwrite check, including races since CLI validation.
     if (mkdir(directory.c_str(), 0700) != 0)
         throw std::runtime_error("cannot create fresh capture directory: " + std::string(std::strerror(errno)));
     const std::string preview = (directory / "preview.png").string();
     const std::string stereo = (directory / "stereo.png").string();
     vr::ScreenshotHandle_t handle = vr::k_unScreenshotHandleInvalid;
+    const auto requested = Clock::now();
+    if (requested >= latest_request)
+        throw std::runtime_error("recording duration ended before screenshot request");
     const auto error = screenshots->RequestScreenshot(&handle, vr::VRScreenshotType_Stereo,
         (directory / "preview").c_str(), (directory / "stereo").c_str());
     if (error != vr::VRScreenshotError_None || handle == vr::k_unScreenshotHandleInvalid)
@@ -405,9 +415,70 @@ std::string capture(Sdk &sdk, const fs::path &directory) {
     // timed-out directories are retained for inspection, never reused or deleted.
     while (!complete_png(preview) || !complete_png(stereo))
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    return "{\"ok\":true,\"command\":\"capture\",\"screenshot_handle\":" + std::to_string(handle)
-        + ",\"preview\":" + quote(preview) + ",\"stereo\":" + quote(stereo)
+    return {handle, preview, stereo, requested, Clock::now()};
+}
+
+std::string capture(Sdk &sdk, const fs::path &directory) {
+    const auto image = capture_files(sdk.get<vr::IVRScreenshots>(vr::IVRScreenshots_Version), directory);
+    return "{\"ok\":true,\"command\":\"capture\",\"screenshot_handle\":" + std::to_string(image.handle)
+        + ",\"preview\":" + quote(image.preview) + ",\"stereo\":" + quote(image.stereo)
         + ",\"capture_scope\":\"OpenVR stereo screenshot; may include overlays, cropped FOV; not full lens output or camera proof\"}";
+}
+
+struct RecordLimits {
+    uintmax_t max_bytes = 512U * 1024U * 1024U;
+    size_t max_frames = 600;
+};
+
+std::string record(Sdk &sdk, const fs::path &directory, unsigned duration, unsigned fps,
+                   const RecordLimits &limits = {}) {
+    auto *screenshots = sdk.get<vr::IVRScreenshots>(vr::IVRScreenshots_Version);
+    if (mkdir(directory.c_str(), 0700) != 0)
+        throw std::runtime_error("cannot create fresh recording directory: " + std::string(std::strerror(errno)));
+    const auto start = Clock::now();
+    const auto deadline = start + std::chrono::seconds(duration);
+    const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / fps));
+    auto next = start;
+    std::vector<Screenshot> frames;
+    uintmax_t completed_bytes = 0;
+    for (;;) {
+        std::this_thread::sleep_until(std::min(next, deadline));
+        if (Clock::now() >= deadline) break;
+        std::ostringstream name;
+        name << "frame-" << std::setw(6) << std::setfill('0') << frames.size();
+        const auto frame = capture_files(screenshots, directory / name.str(), deadline);
+        for (const auto &path : {frame.preview, frame.stereo}) {
+            const auto bytes = fs::file_size(path);
+            if (bytes > limits.max_bytes - completed_bytes)
+                throw std::runtime_error("recording completed frame byte limit exceeded; artifacts retained");
+            completed_bytes += bytes;
+        }
+        frames.push_back(frame);
+        // Skip every elapsed slot. Also preserve spacing after a late scheduler
+        // wakeup, rather than squeezing a second request into the next slot.
+        const auto slot = (frame.completed - start) / period + 1;
+        next = std::max(start + slot * period, frame.requested + period);
+        if (frames.size() >= limits.max_frames) next = deadline;
+    }
+    if (frames.size() < 2) throw std::runtime_error("recording requires at least two completed frames");
+    const auto elapsed = std::chrono::duration<double>(Clock::now() - start).count();
+    std::ostringstream out;
+    out << "{\"ok\":true,\"command\":\"record\",\"source\":\"openvr_screenshots\""
+        << ",\"requested_duration_seconds\":" << duration << ",\"requested_fps\":" << fps
+        << ",\"elapsed_seconds\":";
+    number(out, elapsed);
+    out << ",\"frames\":[";
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto &frame = frames[i];
+        if (i) out << ',';
+        out << "{\"index\":" << i << ",\"request_seconds\":";
+        number(out, std::chrono::duration<double>(frame.requested - start).count());
+        out << ",\"completed_seconds\":";
+        number(out, std::chrono::duration<double>(frame.completed - start).count());
+        out << ",\"preview\":" << quote(frame.preview) << ",\"stereo\":" << quote(frame.stereo) << '}';
+    }
+    out << "],\"capture_scope\":\"sampled OpenVR stereo screenshots, cropped view; not headset-rate video or full lens output\"}";
+    return out.str();
 }
 
 std::string debug(Sdk &sdk, uint32_t device, const std::string &request) {
@@ -453,12 +524,13 @@ int main(int argc, char **argv) {
     output_fd = dup(STDOUT_FILENO);
     if (output_fd < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) return 1;
     try {
-        const std::string usage = "usage: frame-observe status | inputs ABS_MANIFEST_PATH | capture ABS_OUTPUT_DIR | setting true|false|1|0 | debug DEVICE_INDEX REQUEST";
+        const std::string usage = "usage: frame-observe status | inputs ABS_MANIFEST_PATH | capture ABS_OUTPUT_DIR | record ABS_OUTPUT_DIR DURATION_SECONDS FPS | setting true|false|1|0 | debug DEVICE_INDEX REQUEST";
         if (argc < 2) throw std::runtime_error(usage);
         const std::string command = argv[1];
         fs::path directory;
         bool requested = false;
         unsigned device = 0;
+        unsigned duration = 0, fps = 0;
         unsigned input_wait_ms = 2000;
         if (command == "status" && argc == 2) {}
         else if (command == "inputs" && argc == 3) {
@@ -467,7 +539,11 @@ int main(int argc, char **argv) {
             if (!fs::is_regular_file(directory)) throw std::runtime_error("input manifest must be an existing regular file");
             if (const char *value = std::getenv("FRAME_OBSERVE_INPUT_WAIT_MS"))
                 input_wait_ms = integer(value, 0, 10000);
-        } else if (command == "capture" && argc == 3) {
+        } else if ((command == "capture" && argc == 3) || (command == "record" && argc == 5)) {
+            if (command == "record") {
+                duration = integer(argv[3], 1, 60);
+                fps = integer(argv[4], 1, 10);
+            }
             directory = fs::path(argv[2]);
             if (!directory.is_absolute()) throw std::runtime_error("capture output must be absolute");
             std::error_code error;
@@ -482,7 +558,7 @@ int main(int argc, char **argv) {
         } else if (command == "debug" && argc == 4 && argv[3][0]) {
             device = integer(argv[2], 0, vr::k_unMaxTrackedDeviceCount - 1);
         } else throw std::runtime_error(usage);
-        unsigned timeout = 20;
+        unsigned timeout = command == "record" ? duration + 20 : 20;
         if (const char *value = std::getenv("FRAME_OBSERVE_TIMEOUT_SECONDS")) timeout = integer(value, 1, 120);
         struct sigaction action{};
         action.sa_handler = timeout_handler;
@@ -496,6 +572,7 @@ int main(int argc, char **argv) {
             else if (command == "inputs") result = inputs(sdk, directory, input_wait_ms);
             else if (command == "setting") result = set_pause(sdk, requested);
             else if (command == "capture") result = capture(sdk, directory);
+            else if (command == "record") result = record(sdk, directory, duration, fps);
             else result = debug(sdk, device, argv[3]);
         }
         alarm(0);
