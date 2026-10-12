@@ -61,7 +61,10 @@ Cleanup removes only the same inode created by this instance.
 Each connection sends one ASCII text command followed by newline and receives one
 JSON line, then closes. Requests are bounded to 1024 bytes. A partial request has
 a two-second connection deadline. This is only a transport timeout: overrides
-have no lease or disconnect timeout. They remain until release or provider restart.
+have no lease or disconnect timeout inside the native proxy itself. The installed
+headset-side session guard separately releases expired or unleased overrides.
+Use the CLI/MCP session commands to arm and renew its lease. Without the guard,
+raw socket overrides remain until release or provider restart.
 Up to 32 concurrent clients are serviced without blocking the nominal 90Hz tick.
 
 ## Commands

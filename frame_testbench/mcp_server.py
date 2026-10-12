@@ -177,7 +177,7 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def worn(state: Literal['on', 'off', 'physical']) -> CallToolResult:
-        """Override HMD proximity, or restore the physical sensor. Persists until released."""
+        """Override HMD proximity for a leased test session, or restore the physical sensor."""
         return await execute(['worn', state])
 
     @server.tool()
@@ -265,8 +265,23 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def compositor(mode: Literal['awake', 'auto']) -> CallToolResult:
-        """Keep the compositor awake or restore automatic standby. This setting persists."""
+        """Keep the compositor awake during a leased test session or restore automatic standby."""
         return await execute(['compositor', mode])
+
+    @server.tool()
+    async def session_begin(timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=300)] = 120) -> CallToolResult:
+        """Begin a test session without activating displays or overriding input. Idle sessions expire."""
+        return await execute(['session', 'begin', '--timeout', str(timeout_seconds)])
+
+    @server.tool()
+    async def session_renew() -> CallToolResult:
+        """Renew an active session during a deliberate pause between test commands."""
+        return await execute(['session', 'renew'])
+
+    @server.tool()
+    async def session_end() -> CallToolResult:
+        """Release every input override and restore automatic compositor standby immediately."""
+        return await execute(['session', 'end'])
 
     @server.tool()
     async def capture() -> CallToolResult:
@@ -309,7 +324,7 @@ def create_server(config: Config, *, runner=run_cli):
 
     @server.tool()
     async def release_all() -> CallToolResult:
-        """Clear controller inputs and release all pose/worn overrides. Does not change compositor policy."""
+        """End the session, release all input overrides and restore automatic compositor standby."""
         return await execute(['release'])
 
     return server
@@ -324,10 +339,28 @@ def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     try:
-        server = create_server(Config(**vars(args)))
+        config = Config(**vars(args))
+        used_overrides = False
+
+        def session_runner(arguments):
+            nonlocal used_overrides
+            command = arguments[4] if config.host else arguments[0]
+            if command in ('worn', 'pose', 'controller', 'compositor', 'session'):
+                used_overrides = True
+            return run_cli(arguments)
+
+        server = create_server(config, runner=session_runner)
     except ValueError as error:
         parser.error(str(error))
-    server.run(transport='stdio')
+    try:
+        server.run(transport='stdio')
+    finally:
+        if used_overrides:
+            prefix = ['--host', config.host, '--remote-root', config.remote_root] if config.host else []
+            try:
+                run_cli(prefix + ['session', 'end'])
+            except Exception as error:
+                logging.getLogger(__name__).error('Session cleanup failed; headset guard will expire it: %s', error)
     return 0
 
 

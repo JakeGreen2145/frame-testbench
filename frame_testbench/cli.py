@@ -1,4 +1,4 @@
-"""Agent-friendly CLI. Input overrides persist until explicitly released."""
+"""Agent-friendly CLI. Input and power overrides expire after testbench inactivity."""
 import argparse
 import json
 import os
@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
-from . import controller_inputs, install, pose, recording, transport
+from . import controller_inputs, install, pose, recording, transport, session
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,7 +76,7 @@ def parser():
     commands = ap.add_subparsers(dest='command', required=True)
     commands.add_parser('status', help='runtime poses, frames and input override readback')
     commands.add_parser('inputs', help='independent SteamVR controller action readback')
-    compositor = commands.add_parser('compositor', help='persistently control compositor standby policy')
+    compositor = commands.add_parser('compositor', help='temporarily control compositor standby policy')
     compositor.add_argument('mode', choices=('awake', 'auto'))
     worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
     worn.add_argument('state', choices=('on', 'off', 'physical'))
@@ -111,6 +111,13 @@ def parser():
             inputs.add_argument('--touch', choices=('on', 'off'))
     poses.add_parser('inputs-reset', help='neutralize inputs, retaining the controller pose')
     commands.add_parser('release', help='restore physical HMD pose/proximity and disconnect synthetic controllers')
+    sessions = commands.add_parser('session', help='begin, renew, inspect or end a temporary testbench session')
+    actions = sessions.add_subparsers(dest='session_command', required=True)
+    begin = actions.add_parser('begin')
+    begin.add_argument('--timeout', type=int, choices=range(1, 301), default=120,
+                       metavar='SECONDS', help='inactivity timeout, 1..300 seconds; default 120')
+    for action in ('renew', 'status', 'end'):
+        actions.add_parser(action)
     capture = commands.add_parser('capture', help='fresh compositor stereo PNGs and metadata')
     capture.add_argument('--output', help='new output directory, on headset when using --host')
     capture.add_argument('--fetch', help='with --host, download PNGs into this new local directory')
@@ -227,7 +234,7 @@ def main(argv=None):
         else:
             if args.command in ('capture', 'record') and args.fetch:
                 raise ValueError('--fetch requires --host; use --output for local capture')
-            result = dispatch(args, Bench(args.socket))
+            result = session.dispatch(args, Bench(args.socket), dispatch)
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

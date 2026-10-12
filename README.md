@@ -11,7 +11,7 @@ Headset and controller input tools for closed-loop development on Steam Frame. A
 - SteamVR stereo screenshots, with runtime pose/frame metadata and optional downloads to the agent machine.
 - Continuous 1080p headset-view video through Vulkan and the Frame's hardware encoder, with H.264 MP4 output and SSH downloads. Explicit sampled stereo recording remains available.
 
-Input overrides stay active across CLI calls. `release` restores physical input. There is no per-screenshot activation/rollback cycle. Do not wear the headset while another person or agent is driving its pose.
+Input overrides stay active across CLI calls within a temporary session. Commands renew a 120-second inactivity lease. `release` ends the session, restores physical input, and enables automatic compositor standby. The headset-side `frame-testbench-guard.service` expires abandoned sessions, restores state at startup, and refuses unleased overrides. Do not wear the headset while another person or agent is driving its pose.
 
 The input adapter wraps the existing `cv` driver at public OpenVR interface boundaries. It forwards display components, unrelated devices, and unrelated inputs. It does not add a second HMD. This interception is experimental, not a Valve-supported extension mechanism.
 
@@ -23,6 +23,7 @@ Requires Linux, Python 3, a C++17 compiler, and the existing SteamVR installatio
 make
 make test
 ./frame-testbench install --restart
+python3 scripts/setup-session-guard.py
 ./frame-testbench status
 ```
 
@@ -59,7 +60,28 @@ Installation copies the native libraries to a content-addressed directory under 
 ./frame-testbench compositor auto
 ```
 
-`pose reset` releases only pose. `worn physical` releases only proximity. Worn state and pose are independent. `compositor awake` sets `power.pauseCompositorOnStandby=false`; `compositor auto` sets it to true. That setting persists, and `release` deliberately does not change it. HMD standby and whole-machine suspend are separate.
+`pose reset` releases only pose. `worn physical` releases only proximity. Worn state and pose are independent. `compositor awake` temporarily sets `power.pauseCompositorOnStandby=false`; `compositor auto`, `release`, session expiry, and guard startup restore it to true. HMD standby and whole-machine suspend are separate.
+
+### Temporary sessions
+
+Override commands automatically begin or renew a session. Read-only commands renew an existing session but never create one or activate displays. For an explicit session:
+
+```sh
+./frame-testbench session begin --timeout 120
+./frame-testbench compositor awake
+./frame-testbench worn on
+# Run test commands. Renew explicitly during a deliberate pause.
+./frame-testbench session renew
+./frame-testbench session end
+```
+
+`session begin` itself does not enable displays or override input. `session status` reports the remaining lease without renewing it. Timeout can be 1..300 seconds. Captures and recordings extend an existing lease to at least 120 seconds while running, then return to its configured inactivity timeout. Failed commands trigger cleanup. Normal MCP shutdown also ends a session it used; a crash or lost SSH connection is covered by the headset-side expiry.
+
+The installed user service is enabled at login. It releases all synthetic input and restores compositor standby after expiry, checks for unleased native input each second, and restores unleased compositor settings every ten seconds. It does not suspend the machine or force the display off while the physical sensor reports the headset worn. Direct native socket/observer commands do not create or renew a session. A stopped guard prevents CLI override activation. Keep the guard enabled for bench work. Run `release` or `session end` immediately when done.
+
+Install or update the guard with `python3 scripts/setup-session-guard.py` on the headset. It writes `~/.config/systemd/user/frame-testbench-guard.service` for the current checkout, enables it at login, and restarts only the guard. Rerun it if you move the checkout. To remove it, first end the session, run `systemctl --user disable --now frame-testbench-guard.service`, remove that unit file, and run `systemctl --user daemon-reload`.
+
+The session is shared by all clients of the headset's input socket. Coordinate concurrent test clients. The guard does not replace normal physical proximity behavior or prove that a covered/faulty physical sensor will turn off the panels.
 
 Coordinates are right-handed: +X right, +Y up, forward -Z. Positive yaw turns left, positive pitch looks up, positive roll rotates around +Z. Euler composition is Y * X * Z. Relative moves use the chosen world's axes, not head-local axes. `--space raw` is available on `pose set` and `pose move`; the default Standing space uses the runtime's actual raw-to-standing transform, not an assumed floor offset. A relative move requires an active absolute pose first.
 
@@ -95,6 +117,7 @@ Sync the repository without builds, captures, or `.git`, then compile on Frame:
 rsync -az --exclude=.git --exclude=build --exclude=artifacts --exclude=.venv --exclude=__pycache__ ./ frame:dev/frame-testbench/
 ssh frame 'cd dev/frame-testbench && make'
 ./frame-testbench --host frame install --restart
+ssh frame 'cd dev/frame-testbench && python3 scripts/setup-session-guard.py'
 ./frame-testbench --host frame compositor awake
 ./frame-testbench --host frame worn on
 ./frame-testbench --host frame pose set --position 0 1.6 0

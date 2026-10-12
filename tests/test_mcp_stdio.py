@@ -52,9 +52,23 @@ else:
     raise SystemExit(1)
 ''')
         observer.chmod(0o700)
+        # The fixture controls no hardware and must not depend on a real user
+        # systemd service or /run/user directory, including on CI runners.
+        systemctl = self.directory / 'systemctl'
+        systemctl.write_text('#!/bin/sh\nexit 0\n')
+        systemctl.chmod(0o700)
         self.env = dict(os.environ, FRAME_TESTBENCH_OBSERVER=str(observer),
                         FRAME_TESTBENCH_SOCKET=str(self.directory / 'absent.sock'),
+                        XDG_RUNTIME_DIR=str(self.directory),
+                        PATH=str(self.directory) + os.pathsep + os.environ.get('PATH', ''),
                         PYTHONPATH=str(ROOT))
+        from frame_testbench.session import Session
+        from types import SimpleNamespace
+        import json
+        fixture_guard = Session(SimpleNamespace(socket=self.env['FRAME_TESTBENCH_SOCKET']),
+                                self.directory / 'frame-testbench-sessions')
+        fixture_guard.guard_path.write_text(json.dumps({'pid': os.getpid(),
+                                                      'socket': self.env['FRAME_TESTBENCH_SOCKET']}))
 
     async def test_initialize_list_call_validation_failure_images_and_stderr(self):
         import anyio
@@ -70,7 +84,7 @@ else:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, 'frame-testbench')
                     tools = await client.list_tools()
-                    self.assertEqual(len(tools.tools), 19)
+                    self.assertEqual(len(tools.tools), 22)
                     inputs = await client.call_tool('controller_input_status', {})
                     self.assertFalse(inputs.isError, inputs)
                     self.assertTrue(inputs.structuredContent['fixture_input_readback'])
@@ -93,6 +107,12 @@ else:
                     self.assertFalse(capture.isError, capture)
                     self.assertEqual(capture.structuredContent['screenshot_handle'], 77)
                     self.assertEqual([base64.b64decode(c.data) for c in capture.content if c.type == 'image'], [PNG, PNG])
+                    begin = await client.call_tool('session_begin', {'timeout_seconds': 120})
+                    self.assertFalse(begin.isError, begin)
+                    self.assertTrue(begin.structuredContent['active'])
+        # Normal stdio EOF must remove the lease even when the fake proxy is
+        # absent and the fixture's setting-restoration call fails.
+        self.assertEqual(list((self.directory / 'frame-testbench-sessions').glob('*.json')), [])
         self.assertIn('fixture observer diagnostic', log.read_text())
         self.assertNotIn('Failed to parse JSONRPC', log.read_text())
 

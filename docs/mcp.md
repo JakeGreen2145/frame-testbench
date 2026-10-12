@@ -103,6 +103,9 @@ An editable install makes the module available regardless of working directory.
 | `capture` | None | `capture` with a server-owned output/fetch directory |
 | `record` | Optional `duration_seconds`, `fps`, `view` | `record --duration N --fps N --view VIEW` with a server-owned output/fetch directory |
 | `release_all` | None | `release` |
+| `session_begin` | Optional `timeout_seconds`, 1..300, default 120 | `session begin --timeout N` |
+| `session_renew` | None | `session renew` |
+| `session_end` | None | `session end` |
 
 `side` is `left` or `right`. Position and translation are three-element XYZ
 arrays in meters. Rotation is `[yaw, pitch, roll]` in degrees. All numbers must
@@ -174,11 +177,14 @@ Examples of tool arguments:
 {"side": "left", "translation": [0.1, 0, 0], "rotation": [0, 15, 0]}
 ```
 
-Input overrides persist until explicitly reset or released. Disconnecting the
-MCP client does not release them. `release_all` restores physical HMD tracking
-and proximity, clears controller inputs and disconnects the synthetic controllers.
-It leaves the compositor policy unchanged. Physical controller tracking is never overridden. Use
-`compositor` with `{"mode":"auto"}` separately to restore automatic standby.
+Input overrides are leased for a test session with a default 120-second inactivity
+timeout. Test commands renew the lease. `session_begin` itself does not activate
+displays or override input. `session_renew` extends an active session during a deliberate
+pause. `session_end` and `release_all` restore physical HMD tracking and proximity,
+clear controller inputs, disconnect synthetic controllers, and enable automatic
+compositor standby. Normal server shutdown ends a session it used. A crash or lost
+SSH connection is covered by the independently running headset guard and inactivity
+timeout. Physical controller tracking is never overridden.
 Do not apply virtual tracking overrides while someone relies on normal tracking.
 
 ### Recording
