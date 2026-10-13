@@ -17,6 +17,7 @@ mcp = ["mcp>=1.30,<2"]
 [project.scripts]
 frame-testbench = "frame_testbench.cli:main"
 frame-testbench-mcp = "frame_testbench.mcp_server:main"
+frame-testbench-stream = "frame_testbench.stream_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

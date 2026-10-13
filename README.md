@@ -109,6 +109,10 @@ The optional stdio server exposes the same operations as typed MCP tools. It ret
 
 See [MCP setup and tools](docs/mcp.md) for installation and client configuration. Installation/restarts remain explicit CLI operations rather than agent-exposed MCP tools.
 
+## Streamed Unity game tests
+
+The optional [streamed UGEVR session client](docs/streamed-sessions.md) launches through UGEVR's external Windows controller and keeps headset test leases and bounded captures in this repository. It reports host, peer, both-eye and input evidence separately. Pairing, stream controls and physical game association still need integration probes. Normal UGEVR use does not require Frame Testbench.
+
 ## Remote agent use
 
 Sync the repository without builds, captures, or `.git`, then compile on Frame:
