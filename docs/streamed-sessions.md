@@ -12,6 +12,8 @@ The initial command contract is `launch`, `status` and `stop`, each with a uniqu
 
 A structured failed deployment reply can have a zero process ID before the game starts. The client preserves that failure and binds the run ID and executable. A later nonzero process identity must remain stable. Structured exit code 3 results remain failed or stopped; they do not establish readiness.
 
+`Client.launch` accepts an optional typed integer `steam_app_id`, and the `run` CLI exposes `--steam-app-id`. Valid IDs are positive decimal values through 4294967295. The client rejects booleans, strings and numeric coercion. It forwards the ID to the controller, which sets `SteamAppId` and `SteamGameId` only in the owned game child. It does not change the test process or machine environment.
+
 `frame-testbench-stream` is an optional installed entry point. It adds no tools to the existing MCP server and changes no existing headset CLI commands. It currently supports a fixed SSH headset target and a local Windows controller. Configure the actual paired PC and headset before using it.
 
 ```powershell
@@ -36,6 +38,8 @@ Host readiness requires a live process, matching fresh injector status, engine r
 The default observation period is 180 seconds, with a maximum of 300. Continuous headset video is split into recording chunks of at most 60 seconds. Each chunk also has a separate stereo screenshot. The video remains the existing left-eye recording path. Screenshot and video success prove only artifact collection. They cannot substitute for both-eye game association.
 
 Each run retains `session.yaml`, the controller run ID, requested and recorded duration, artifact directories, evidence references and separate cleanup outcomes. Stream cleanup remains `unavailable`; host termination and lease expiry do not prove the streaming connection stopped. A final YAML result also appears on stdout. Exit code 4 means evidence remains incomplete, 3 means the run failed, 130 means cancellation and 2 means a CLI error. Cancellation is checked between bounded headset operations. A capture or recording can take up to its 120-second client timeout before cleanup runs.
+
+Host cleanup becomes `observed` only when the process has exited, the state is `stopped`, `cleanup_complete` is `true` and `deployment_restored` is `true` or `not_applicable`. A stopped process with incomplete or unconfirmed restoration remains `pending`. A controller `failed` state produces failed host cleanup and preserves its `last_error` reason, even after process exit. Metadata retains restoration and completion fields separately. The standalone `stop` CLI uses these same rules for its exit code.
 
 There is no automatic stream-start control in this change. The default stream request is `unavailable` and the mode is `assisted`. A caller may supply a source-verified `stream_request` callback, which can return `requested`, `assisted` or `unavailable`. That outcome never sets readiness. The CLI deliberately has no arbitrary command, undocumented URI or caller-supplied readiness flag.
 

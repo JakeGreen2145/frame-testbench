@@ -1,6 +1,7 @@
 """Optional external UGEVR test orchestration, separate from the headset's CLI."""
 import argparse
 import json
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -9,7 +10,16 @@ import threading
 
 from . import transport
 from .streamed_session import Orchestrator
-from .ugevr import Client, write_scalars
+from .ugevr import Client, validate_steam_app_id, write_scalars
+
+
+def steam_id_argument(text):
+    if not re.fullmatch(r'[0-9]+', text):
+        raise argparse.ArgumentTypeError('Steam application ID must be positive decimal digits')
+    try:
+        return validate_steam_app_id(int(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def run_headset_cli(arguments):
@@ -47,6 +57,8 @@ def main(argv=None):
     run.add_argument('--deployment-script', type=Path)
     run.add_argument('--prepared', action='store_true', help='explicit development-only predeployed launch')
     run.add_argument('--game-arg', action='append', default=[])
+    run.add_argument('--steam-app-id', type=steam_id_argument,
+                     help='set SteamAppId and SteamGameId only in the controller-owned child')
     run.add_argument('--host', required=True, help='fixed headset SSH alias')
     run.add_argument('--remote-root', default='dev/frame-testbench')
     run.add_argument('--expected-peer', required=True)
@@ -59,7 +71,8 @@ def main(argv=None):
         if args.command in ('status', 'stop'):
             status = getattr(client, args.command)()
             print(write_scalars(status.values), end='')
-            return 0 if args.command == 'status' or status.state == 'stopped' else 4
+            return (0 if args.command == 'status' or status.cleanup_outcome == 'observed'
+                    else 3 if status.cleanup_outcome == 'failed' else 4)
         deployment = (args.game_root, args.distribution_root, args.deployment_script)
         if args.prepared and any(deployment):
             raise ValueError('prepared launch cannot include deployment options')
@@ -79,7 +92,7 @@ def main(argv=None):
                 cancelled=cancellation, launch_options={
                     'game_root': args.game_root, 'distribution_root': args.distribution_root,
                     'deployment_script': args.deployment_script, 'prepared': args.prepared,
-                    'game_arguments': args.game_arg})
+                    'game_arguments': args.game_arg, 'steam_app_id': args.steam_app_id})
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)

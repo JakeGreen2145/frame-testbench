@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from frame_testbench.ugevr import Client, HostStatus, ProtocolError, read_scalars, run_process, write_scalars
-from frame_testbench.streamed_session import Observation, Orchestrator
+from frame_testbench.streamed_session import Observation, Orchestrator, RunResult
 
 RUN = '11223344-5566-7788-99aa-bbccddeeff00'
 
@@ -18,7 +18,8 @@ def values(**changes):
     result = dict(schema_version='1', run_id=RUN, process_id='321', process_start_utc_ticks='123456',
                   executable='C:\\Game path\\game.exe', state='active', process_alive='true',
                   engine_ready='true', runtime_ready='true', rendering_active='true',
-                  injector_status='fresh', stream_ready='false', stream_status='unavailable')
+                  injector_status='fresh', stream_ready='false', stream_status='unavailable',
+                  cleanup_complete='false', deployment_restored='false')
     result.update(changes)
     return result
 
@@ -99,12 +100,57 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         bench.assert_not_called()
 
+    def test_steam_app_id_is_typed_bounded_and_forwarded_without_coercion(self):
+        calls = []
+        client = Client(['unused'], 'owned', runner=lambda args, *_: (
+            calls.append(args) or 0, write_scalars(values()), ''))
+        client.launch('fixture.exe', prepared=True, steam_app_id=42)
+        self.assertIn('--steam-app-id', calls[-1])
+        self.assertEqual(calls[-1][calls[-1].index('--steam-app-id') + 1], '42')
+        for invalid in [True, False, 0, -1, 4294967296, '42', 42.0]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                client.launch('fixture.exe', prepared=True, steam_app_id=invalid)
+        self.assertEqual(len(calls), 1)
+        client.launch('fixture.exe', prepared=True)
+        self.assertNotIn('--steam-app-id', calls[-1])
+
+    def test_cli_steam_id_validation_and_forwarding(self):
+        from frame_testbench.stream_cli import main, steam_id_argument
+        import argparse
+        self.assertEqual(steam_id_argument('4294967295'), 4294967295)
+        for invalid in ['0', '-1', '+42', '42.0', ' 42', '4294967296', 'true', '٤٢']:
+            with self.subTest(invalid=invalid), self.assertRaises(argparse.ArgumentTypeError):
+                steam_id_argument(invalid)
+        with patch('frame_testbench.stream_cli.Orchestrator') as orchestrator, patch('builtins.print'):
+            orchestrator.return_value.run.return_value = RunResult('test')
+            code = main(['--controller-dll', 'controller.dll', '--session-dir', 'owned',
+                         'run', '--exe', 'fixture.exe', '--prepared', '--host', 'frame',
+                         '--expected-peer', 'pc', '--steam-app-id', '42'])
+        self.assertEqual(code, 4)
+        self.assertEqual(orchestrator.return_value.run.call_args.kwargs['launch_options']['steam_app_id'], 42)
+
+    def test_standalone_stop_exit_code_requires_restoration_and_terminal_cleanup(self):
+        from frame_testbench.stream_cli import main
+        cases = [({'deployment_restored': 'true', 'cleanup_complete': 'true'}, 0),
+                 ({'deployment_restored': 'not_applicable', 'cleanup_complete': 'true'}, 0),
+                 ({'deployment_restored': 'false', 'cleanup_complete': 'true'}, 4),
+                 ({'deployment_restored': 'true', 'cleanup_complete': 'false'}, 4),
+                 ({'state': 'failed', 'last_error': 'restore failed'}, 3)]
+        for fields, expected in cases:
+            with self.subTest(fields=fields), patch('frame_testbench.stream_cli.Client') as client, patch('builtins.print'):
+                status_fields = dict(state='stopped', process_alive='false')
+                status_fields.update(fields)
+                client.return_value.stop.return_value = HostStatus.parse(values(**status_fields))
+                self.assertEqual(main(['--controller-dll', 'controller.dll', '--session-dir', 'owned', 'stop']), expected)
+
 
 class Host:
     def __init__(self):
         self.calls = []
         self.status_value = HostStatus.parse(values())
         self.stop_error = False
+        self.stop_fields = dict(state='stopped', process_alive='false', cleanup_complete='true',
+                                deployment_restored='true')
 
     def launch(self, executable, **options):
         self.calls.append('launch')
@@ -118,7 +164,7 @@ class Host:
         self.calls.append('stop')
         if self.stop_error:
             raise RuntimeError('controller unreachable')
-        return HostStatus.parse(values(state='stopped', process_alive='false'))
+        return HostStatus.parse(values(**self.stop_fields))
 
 
 class StreamTests(unittest.TestCase):
@@ -228,6 +274,32 @@ class StreamTests(unittest.TestCase):
         self.assertIn('headset cleanup', result.error)
         self.assertIn('host cleanup', result.error)
         self.assertEqual(self.host.calls[-1], 'stop')
+
+    def test_stopped_process_does_not_imply_deployment_restoration(self):
+        for restored, complete, expected in [('true', 'true', 'observed'),
+                                              ('not_applicable', 'true', 'observed'),
+                                              ('false', 'true', 'pending'),
+                                              ('pending', 'true', 'pending'),
+                                              ('true', 'false', 'pending')]:
+            with self.subTest(restored=restored, complete=complete):
+                self.now = 100
+                self.host.stop_fields.update(deployment_restored=restored, cleanup_complete=complete)
+                result = self.run_test()
+                self.assertEqual(result.host_cleanup, expected)
+                self.assertEqual(result.host_cleanup_complete, complete == 'true')
+                self.assertEqual(result.host_deployment_restored, restored)
+                if expected == 'pending':
+                    self.assertIn('cleanup is pending', result.host_cleanup_reason)
+
+    def test_failed_host_cleanup_reports_reason_even_when_process_has_exited(self):
+        self.host.stop_fields.update(state='failed', deployment_restored='false',
+                                     last_error='restore failed: file was changed')
+        result = self.run_test()
+        self.assertEqual(result.host_cleanup, 'failed')
+        self.assertEqual(result.outcome, 'failed')
+        self.assertEqual(result.host_cleanup_reason, 'restore failed: file was changed')
+        self.assertIn(result.host_cleanup_reason, result.error)
+        self.assertEqual(result.headset_cleanup, 'observed')
 
     def test_existing_shared_lease_is_not_ended_or_used(self):
         self.active = True

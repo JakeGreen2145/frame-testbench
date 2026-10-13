@@ -57,6 +57,13 @@ def boolean(values, key):
     return values[key] == 'true'
 
 
+def validate_steam_app_id(value):
+    """Steam's controller option accepts a positive uint32 ID, never a coerced bool."""
+    if value is not None and (type(value) is not int or not 1 <= value <= 4294967295):
+        raise ValueError('Steam application ID must be an integer from 1 to 4294967295')
+    return value
+
+
 @dataclass(frozen=True)
 class HostStatus:
     run_id: str
@@ -95,6 +102,33 @@ class HostStatus:
     def ready(self):
         return (self.state == 'active' and self.process_alive and self.engine_ready
                 and self.runtime_ready and self.rendering_active and self.injector_status == 'fresh')
+
+    @property
+    def cleanup_complete(self):
+        return self.values.get('cleanup_complete') == 'true'
+
+    @property
+    def deployment_restored(self):
+        return self.values.get('deployment_restored', 'unknown')
+
+    @property
+    def cleanup_outcome(self):
+        if self.state == 'failed':
+            return 'failed'
+        if (self.state == 'stopped' and not self.process_alive and self.cleanup_complete
+                and self.deployment_restored in ('true', 'not_applicable')):
+            return 'observed'
+        return 'pending'
+
+    @property
+    def cleanup_reason(self):
+        if self.state == 'failed':
+            return self.values.get('last_error') or 'controller session failed'
+        if self.cleanup_outcome == 'pending':
+            return ('host cleanup is pending; state=' + self.state
+                    + ', deployment_restored=' + self.deployment_restored
+                    + ', cleanup_complete=' + str(self.cleanup_complete).lower())
+        return ''
 
 
 def run_process(argv, timeout, cancelled):
@@ -158,8 +192,12 @@ class Client:
         return status
 
     def launch(self, executable, *, game_root=None, distribution_root=None,
-               deployment_script=None, prepared=False, game_arguments=(), cancelled=None):
+               deployment_script=None, prepared=False, game_arguments=(),
+               steam_app_id: int | None = None, cancelled=None):
+        validate_steam_app_id(steam_app_id)
         options = ['--exe', str(Path(executable).absolute()), '--timeout-seconds', '30']
+        if steam_app_id is not None:
+            options += ['--steam-app-id', str(steam_app_id)]
         if prepared:
             if any((game_root, distribution_root, deployment_script)):
                 raise ValueError('prepared launch cannot include deployment options')

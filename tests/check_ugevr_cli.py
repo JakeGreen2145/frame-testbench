@@ -30,7 +30,7 @@ def main():
     finally:
         # The fixture exits after three seconds. No forced process termination or VR runtime.
         stopped = client.stop()
-        assert stopped.state == 'stopped' and not stopped.process_alive
+        assert stopped.cleanup_outcome == 'observed', stopped.cleanup_reason
         if status is not None:
             assert stopped.run_id == status.run_id
         print('PASS actual controller graceful stop after controlled child natural exit')

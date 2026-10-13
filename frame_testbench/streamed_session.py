@@ -33,6 +33,9 @@ class RunResult:
     mode: str = 'assisted'
     outcome: str = 'incomplete'
     host_cleanup: str = 'not_started'
+    host_cleanup_complete: bool = False
+    host_deployment_restored: str = 'unknown'
+    host_cleanup_reason: str = ''
     headset_cleanup: str = 'not_started'
     stream_cleanup: str = 'unavailable'
     requested_seconds: int = 0
@@ -230,10 +233,19 @@ class Orchestrator:
                 try:
                     stopped = self.host.stop()
                     result.host_run_id = result.host_run_id or stopped.run_id
-                    result.host_cleanup = ('observed' if stopped.state == 'stopped'
-                                           and not stopped.process_alive else 'pending')
+                    result.host_cleanup = stopped.cleanup_outcome
+                    result.host_cleanup_complete = stopped.cleanup_complete
+                    result.host_deployment_restored = stopped.deployment_restored
+                    result.host_cleanup_reason = stopped.cleanup_reason
+                    if result.host_cleanup == 'failed':
+                        result.error += '; host cleanup: ' + result.host_cleanup_reason
+                        if result.outcome != 'cancelled':
+                            result.outcome = 'failed'
                 except Exception as error:
                     result.host_cleanup = 'failed'
+                    result.host_cleanup_reason = str(error)
                     result.error += '; host cleanup: ' + str(error)
+                    if result.outcome != 'cancelled':
+                        result.outcome = 'failed'
             (directory / 'session.yaml').write_text(result.metadata(), encoding='utf-8')
         return result
