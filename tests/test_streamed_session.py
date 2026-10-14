@@ -337,6 +337,78 @@ class StreamTests(unittest.TestCase):
         self.assertIn('lease renewal failed', result.error)
         self.assertEqual((result.host_cleanup, result.headset_cleanup), ('observed', 'observed'))
 
+    def test_experimental_provider_connects_before_game_and_preserves_independent_evidence(self):
+        from frame_testbench.steam_cef import StreamState
+        parent = self
+        class Provider:
+            mode = 'experimental_steam_cef'
+            last_request = 'requested'
+            owns_stream = True
+            calls = []
+            def connect(self, cancelled):
+                parent.assertTrue(parent.active)
+                parent.assertEqual(parent.host.calls, [])
+                self.calls.append('connect')
+                return StreamState('42', True, True, False, True, False, None)
+            def hide_dashboard(self, cancelled):
+                parent.assertIn('launch', parent.host.calls)
+                self.calls.append('hide')
+                return StreamState('42', True, True, False, True, False, False)
+            def observe(self, cancelled):
+                self.calls.append('observe')
+                return StreamState('42', True, True, False, False, False, None)
+            def disconnect(self):
+                self.calls.append('disconnect_unavailable')
+                return 'unavailable'
+        provider = Provider()
+        result = self.run_test(stream_provider=provider, hide_dashboard=True)
+        self.assertEqual(provider.calls[:2], ['connect', 'hide'])
+        self.assertEqual(result.mode, 'experimental_steam_cef')
+        self.assertEqual(result.stream_association, 'observed')
+        self.assertEqual(result.stream_client_id, '42')
+        self.assertEqual(result.dashboard_visibility, 'hidden')
+        self.assertEqual(result.stream_cleanup, 'unavailable')
+        self.assertEqual(result.outcome, 'incomplete')
+        self.assertFalse(result.association_verified)
+        self.assertEqual((result.both_eye_evidence, result.input_forwarding_evidence), ('unknown', 'unknown'))
+
+    def test_stream_request_without_association_does_not_launch_game(self):
+        from frame_testbench.steam_cef import StreamState
+        class Provider:
+            mode = 'experimental_steam_cef'
+            last_request = 'requested'
+            owns_stream = False
+            def connect(self, cancelled):
+                return StreamState('42', True, False, False, True, True, None)
+        result = self.run_test(stream_provider=Provider())
+        self.assertEqual(self.host.calls, [])
+        self.assertEqual(result.stream_request, 'requested')
+        self.assertEqual(result.stream_association, 'unknown')
+        self.assertEqual(result.host_cleanup, 'not_started')
+        self.assertEqual(result.headset_cleanup, 'observed')
+
+    def test_reused_stream_is_not_disconnected_and_loss_is_reported(self):
+        from frame_testbench.steam_cef import StreamState
+        class Provider:
+            mode = 'experimental_steam_cef'
+            last_request = 'reused'
+            owns_stream = False
+            def connect(self, cancelled):
+                return StreamState('42', True, True, False, False, False, None)
+            def observe(self, cancelled):
+                return StreamState('42', True, False, False, False, False, None)
+            def disconnect(self):
+                raise AssertionError('reused stream must not be disconnected')
+        result = self.run_test(stream_provider=Provider())
+        self.assertEqual(result.outcome, 'failed')
+        self.assertEqual(result.stream_association, 'unknown')
+        self.assertIn('association was lost', result.error)
+        self.assertEqual(result.host_cleanup, 'observed')
+
+    def test_dashboard_dismissal_requires_explicit_provider(self):
+        with self.assertRaises(ValueError):
+            self.run_test(hide_dashboard=True)
+
     def test_heartbeat_renews_during_long_running_work_and_stops_before_cleanup(self):
         renewals = []
         original = self.bench

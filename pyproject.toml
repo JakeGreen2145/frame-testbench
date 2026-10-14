@@ -18,6 +18,7 @@ mcp = ["mcp>=1.30,<2"]
 frame-testbench = "frame_testbench.cli:main"
 frame-testbench-mcp = "frame_testbench.mcp_server:main"
 frame-testbench-stream = "frame_testbench.stream_cli:main"
+frame-testbench-steam = "frame_testbench.steam_cef:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

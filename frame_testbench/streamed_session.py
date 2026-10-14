@@ -27,6 +27,10 @@ class RunResult:
     host_run_id: str = ''
     host_ready: bool = False
     stream_request: str = 'unavailable'
+    stream_association: str = 'unknown'
+    stream_client_id: str = ''
+    stream_owned: bool = False
+    dashboard_visibility: str = 'unknown'
     peer_evidence: str = 'unknown'
     both_eye_evidence: str = 'unknown'
     input_forwarding_evidence: str = 'unknown'
@@ -66,7 +70,7 @@ class RunResult:
 class Orchestrator:
     def __init__(self, host, bench, artifacts_dir, expected_peer, *,
                  stream_request=None, observe=None, clock=time.monotonic,
-                 wait=None, heartbeat_seconds=30):
+                 wait=None, heartbeat_seconds=30, stream_provider=None, hide_dashboard=False):
         """bench calls the existing CLI; no ownership of Steam pairing or runtime settings."""
         if not expected_peer:
             raise ValueError('expected peer identity is required')
@@ -76,6 +80,11 @@ class Orchestrator:
         self.artifacts_dir = Path(artifacts_dir).absolute()
         self.expected_peer = expected_peer
         self.stream_request, self.observe = stream_request, observe
+        if stream_provider is not None and stream_request is not None:
+            raise ValueError('choose one stream provider or request callback')
+        if hide_dashboard and stream_provider is None:
+            raise ValueError('dashboard control requires an explicit stream provider')
+        self.stream_provider, self.hide_dashboard = stream_provider, hide_dashboard
         self.clock = clock
         self.wait = wait or (lambda event, seconds: event.wait(seconds))
         self.heartbeat_seconds = heartbeat_seconds
@@ -162,6 +171,17 @@ class Orchestrator:
             result.headset_cleanup = 'pending'
             heartbeat = threading.Thread(target=renew, name='frame-lease-renewal', daemon=True)
             heartbeat.start()
+            if self.stream_provider is not None:
+                # The wireless runtime is a prerequisite. An unconnected host can return OpenVR216.
+                result.mode = self.stream_provider.mode
+                stream = self.stream_provider.connect(cancelled)
+                result.stream_request = self.stream_provider.last_request
+                result.stream_client_id = stream.client_id
+                result.stream_owned = self.stream_provider.owns_stream
+                result.stream_association = 'observed' if stream.stream_associated else 'unknown'
+                if not stream.stream_associated or stream.other_stream_active:
+                    raise TimeoutError('intended SteamVR stream association was not observed')
+                check()
             host_attempted = True
             result.host_cleanup = 'pending'
             status = self.host.launch(executable, cancelled=cancelled, **(launch_options or {}))
@@ -176,6 +196,10 @@ class Orchestrator:
                 self.wait(cancelled, .25)
                 status = self.host.status(cancelled)
             result.host_ready = True
+            if self.stream_provider is not None and self.hide_dashboard:
+                dashboard = self.stream_provider.hide_dashboard(cancelled)
+                result.dashboard_visibility = ('hidden' if dashboard.dashboard_visible is False
+                                               else 'visible' if dashboard.dashboard_visible is True else 'unknown')
             if self.stream_request is not None:
                 # Request must use a separately verified control. It cannot assert stream readiness.
                 request = self.stream_request(status, self.expected_peer)
@@ -190,6 +214,11 @@ class Orchestrator:
                 status = self.host.status(cancelled)
                 if not status.ready:
                     raise RuntimeError('host lost injector/runtime/render readiness')
+                if self.stream_provider is not None:
+                    stream = self.stream_provider.observe(cancelled)
+                    result.stream_association = 'observed' if stream.stream_associated else 'unknown'
+                    if not stream.stream_associated or stream.other_stream_active:
+                        raise RuntimeError('intended SteamVR stream association was lost')
                 self._observe(status, result)
                 check()
                 # Independent stereo captures are retained alongside left-eye continuous video.
@@ -247,5 +276,10 @@ class Orchestrator:
                     result.error += '; host cleanup: ' + str(error)
                     if result.outcome != 'cancelled':
                         result.outcome = 'failed'
+            if self.stream_provider is not None:
+                result.stream_request = self.stream_provider.last_request
+                # No source-backed disconnect is claimed until its physical probe is validated.
+                if self.stream_provider.owns_stream:
+                    result.stream_cleanup = self.stream_provider.disconnect()
             (directory / 'session.yaml').write_text(result.metadata(), encoding='utf-8')
         return result

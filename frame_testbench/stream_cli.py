@@ -62,6 +62,10 @@ def main(argv=None):
     run.add_argument('--host', required=True, help='fixed headset SSH alias')
     run.add_argument('--remote-root', default='dev/frame-testbench')
     run.add_argument('--expected-peer', required=True)
+    run.add_argument('--experimental-steam-cef', action='store_true',
+                     help='explicit experimental stream request through an already exposed Steam CEF context')
+    run.add_argument('--hide-steam-dashboard', action='store_true',
+                     help='explicitly dismiss the intended stream dashboard after host readiness')
     run.add_argument('--artifacts-dir', type=Path, default=Path('artifacts/streamed'))
     run.add_argument('--duration-seconds', type=int, default=180)
     run.add_argument('--chunk-seconds', type=int, default=30)
@@ -78,6 +82,8 @@ def main(argv=None):
             raise ValueError('prepared launch cannot include deployment options')
         if not args.prepared and not all(deployment):
             raise ValueError('run requires game root, distribution root and deployment script')
+        if args.hide_steam_dashboard and not args.experimental_steam_cef:
+            raise ValueError('dashboard dismissal requires --experimental-steam-cef')
         transport.remote_argv(args.host, args.remote_root, [])  # Validate before host launch.
         prefix = ['--host', args.host, '--remote-root', args.remote_root]
         cancellation = threading.Event()
@@ -85,8 +91,13 @@ def main(argv=None):
         try:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 previous[sig] = signal.signal(sig, lambda signum, frame: cancellation.set())
+            stream_provider = None
+            if args.experimental_steam_cef:
+                from .steam_cef import SteamCEF
+                stream_provider = SteamCEF(args.host, args.expected_peer)
             orchestrator = Orchestrator(client, lambda arguments: run_headset_cli(prefix + arguments),
-                                        args.artifacts_dir, args.expected_peer)
+                                        args.artifacts_dir, args.expected_peer,
+                                        stream_provider=stream_provider, hide_dashboard=args.hide_steam_dashboard)
             result = orchestrator.run(
                 args.exe, duration_seconds=args.duration_seconds, chunk_seconds=args.chunk_seconds,
                 cancelled=cancellation, launch_options={
