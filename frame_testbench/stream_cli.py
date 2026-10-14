@@ -10,7 +10,7 @@ import threading
 
 from . import transport
 from .streamed_session import Orchestrator
-from .ugevr import Client, validate_steam_app_id, write_scalars
+from .ugevr import Client, validate_replacement_path, validate_steam_app_id, write_scalars
 
 
 def steam_id_argument(text):
@@ -18,6 +18,13 @@ def steam_id_argument(text):
         raise argparse.ArgumentTypeError('Steam application ID must be positive decimal digits')
     try:
         return validate_steam_app_id(int(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def replacement_argument(text):
+    try:
+        return validate_replacement_path(text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
 
@@ -57,6 +64,8 @@ def main(argv=None):
     run.add_argument('--deployment-script', type=Path)
     run.add_argument('--prepared', action='store_true', help='explicit development-only predeployed launch')
     run.add_argument('--game-arg', action='append', default=[])
+    run.add_argument('--replace-path', action='append', type=replacement_argument, default=[],
+                     help='explicitly select one literal relative deployment conflict; repeat per file')
     run.add_argument('--steam-app-id', type=steam_id_argument,
                      help='set SteamAppId and SteamGameId only in the controller-owned child')
     run.add_argument('--host', required=True, help='fixed headset SSH alias')
@@ -78,7 +87,7 @@ def main(argv=None):
             return (0 if args.command == 'status' or status.cleanup_outcome == 'observed'
                     else 3 if status.cleanup_outcome == 'failed' else 4)
         deployment = (args.game_root, args.distribution_root, args.deployment_script)
-        if args.prepared and any(deployment):
+        if args.prepared and (any(deployment) or args.replace_path):
             raise ValueError('prepared launch cannot include deployment options')
         if not args.prepared and not all(deployment):
             raise ValueError('run requires game root, distribution root and deployment script')
@@ -103,7 +112,8 @@ def main(argv=None):
                 cancelled=cancellation, launch_options={
                     'game_root': args.game_root, 'distribution_root': args.distribution_root,
                     'deployment_script': args.deployment_script, 'prepared': args.prepared,
-                    'game_arguments': args.game_arg, 'steam_app_id': args.steam_app_id})
+                    'game_arguments': args.game_arg, 'steam_app_id': args.steam_app_id,
+                    'replacement_paths': args.replace_path})
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)

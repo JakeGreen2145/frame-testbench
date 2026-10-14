@@ -14,6 +14,16 @@ A structured failed deployment reply can have a zero process ID before the game 
 
 `Client.launch` accepts an optional typed integer `steam_app_id`, and the `run` CLI exposes `--steam-app-id`. Valid IDs are positive decimal values through 4294967295. The client rejects booleans, strings and numeric coercion. It forwards the ID to the controller, which sets `SteamAppId` and `SteamGameId` only in the owned game child. It does not change the test process or machine environment.
 
+Deployment conflicts require explicit selections. `Client.launch(replacement_paths=[...])` and repeated `run --replace-path RELATIVE_PATH` forward each selected file to the controller. The default selects none. Paths must be literal relative file paths; rooted paths, drive/stream qualifiers, wildcards and traversal or ambiguous segments fail before CLI transport. Both slash styles are accepted and forwarded unchanged. Prepared mode rejects replacements. The external controller and deployment script still check actual root containment, reparse points, conflicts and restoration ownership. Testbench never expands a wildcard or selects every conflict.
+
+For example, after inspecting those exact conflicts, select them individually:
+
+```text
+--replace-path BepInEx/config/BepInEx.cfg
+--replace-path BepInEx/plugins/UnityVRInjector/UnityVRInjector.dll
+--replace-path UnityVRRenderBridge.dll
+```
+
 `frame-testbench-stream` is an optional installed entry point. It adds no tools to the existing MCP server and changes no existing headset CLI commands. It currently supports a fixed SSH headset target and a local Windows controller. Configure the actual paired PC and headset before using it.
 
 ```powershell

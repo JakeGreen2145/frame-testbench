@@ -64,6 +64,17 @@ def validate_steam_app_id(value):
     return value
 
 
+def validate_replacement_path(value):
+    """Select one literal file inside the controller's deployment root, on every host OS."""
+    if (not isinstance(value, str) or not value.strip() or value[0] in '/\\'
+            or any(ord(c) < 32 or c in ':<>"|?*' for c in value)):
+        raise ValueError('replacement must be a literal relative deployment file path')
+    parts = value.replace('\\', '/').split('/')
+    if any(not part or part in ('.', '..') or part.endswith((' ', '.')) for part in parts):
+        raise ValueError('replacement path cannot contain traversal or ambiguous path segments')
+    return value
+
+
 @dataclass(frozen=True)
 class HostStatus:
     run_id: str
@@ -193,13 +204,16 @@ class Client:
 
     def launch(self, executable, *, game_root=None, distribution_root=None,
                deployment_script=None, prepared=False, game_arguments=(),
-               steam_app_id: int | None = None, cancelled=None):
+               steam_app_id: int | None = None, replacement_paths=(), cancelled=None):
         validate_steam_app_id(steam_app_id)
+        if isinstance(replacement_paths, (str, bytes)):
+            raise ValueError('replacement paths must be a sequence of selected file paths')
+        replacements = tuple(validate_replacement_path(path) for path in replacement_paths)
         options = ['--exe', str(Path(executable).absolute()), '--timeout-seconds', '30']
         if steam_app_id is not None:
             options += ['--steam-app-id', str(steam_app_id)]
         if prepared:
-            if any((game_root, distribution_root, deployment_script)):
+            if any((game_root, distribution_root, deployment_script)) or replacements:
                 raise ValueError('prepared launch cannot include deployment options')
             options += ['--prepared', 'true']
         else:
@@ -208,6 +222,8 @@ class Client:
             for name, value in [('game-root', game_root), ('distribution-root', distribution_root),
                                 ('deployment-script', deployment_script)]:
                 options += ['--' + name, str(Path(value).absolute())]
+            for path in replacements:
+                options += ['--replace-path', path]
         for argument in game_arguments:
             options += ['--game-arg', argument]
         return self._call('launch', options, cancelled)

@@ -129,6 +129,62 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertEqual(orchestrator.return_value.run.call_args.kwargs['launch_options']['steam_app_id'], 42)
 
+    def test_explicit_replacement_paths_forward_as_literal_repeated_arguments(self):
+        selected = ['BepInEx/config/BepInEx.cfg',
+                    'BepInEx/plugins/UnityVRInjector/UnityVRInjector.dll',
+                    'UnityVRRenderBridge.dll', r'literal\$() file.dll']
+        calls = []
+        client = Client(['unused'], 'owned', runner=lambda args, *_: (
+            calls.append(args) or 0, write_scalars(values()), ''))
+        deployment = dict(game_root='game', distribution_root='payload', deployment_script='deploy.ps1')
+        client.launch('game/fixture.exe', replacement_paths=selected, **deployment)
+        forwarded = [calls[0][i + 1] for i, arg in enumerate(calls[0]) if arg == '--replace-path']
+        self.assertEqual(forwarded, selected)
+        client.launch('game/fixture.exe', **deployment)
+        self.assertNotIn('--replace-path', calls[1])
+
+    def test_dangerous_or_prepared_replacements_reject_before_controller(self):
+        calls = []
+        client = Client(['unused'], 'owned', runner=lambda *args: calls.append(args))
+        deployment = dict(game_root='game', distribution_root='payload', deployment_script='deploy.ps1')
+        invalid = ['', ' ', '..', '../outside.dll', r'..\outside.dll', 'sub/../outside.dll',
+                   '/outside.dll', r'\outside.dll', r'\\server\share\file.dll',
+                   'C:outside.dll', 'C:/outside.dll', 'file.dll:stream', '*', 'sub/*.dll',
+                   'sub//file.dll', 'sub/./file.dll', 'sub/file.dll ', 'sub/file.dll.',
+                   'sub/line\nfile.dll', 42, True, Path('file.dll')]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                client.launch('game/fixture.exe', replacement_paths=[value], **deployment)
+        with self.assertRaises(ValueError):
+            client.launch('game/fixture.exe', replacement_paths='file.dll', **deployment)
+        with self.assertRaises(ValueError):
+            client.launch('fixture.exe', prepared=True, replacement_paths=['file.dll'])
+        self.assertEqual(calls, [])
+
+    def test_cli_replacement_selection_and_prepared_refusal_before_any_transport(self):
+        from frame_testbench.stream_cli import main, replacement_argument
+        import argparse
+        selected = ['BepInEx/config/BepInEx.cfg', 'UnityVRRenderBridge.dll']
+        prefix = ['--controller-dll', 'controller.dll', '--session-dir', 'owned',
+                  'run', '--exe', 'game/fixture.exe', '--host', 'frame', '--expected-peer', 'pc']
+        with self.assertRaises(argparse.ArgumentTypeError):
+            replacement_argument('../outside.dll')
+        with patch('frame_testbench.stream_cli.Orchestrator') as orchestrator, patch('builtins.print'):
+            orchestrator.return_value.run.return_value = RunResult('test')
+            code = main(prefix + ['--game-root', 'game', '--distribution-root', 'payload',
+                                  '--deployment-script', 'deploy.ps1', '--replace-path', selected[0],
+                                  '--replace-path', selected[1]])
+        self.assertEqual(code, 4)
+        self.assertEqual(orchestrator.return_value.run.call_args.kwargs['launch_options']['replacement_paths'], selected)
+        with patch('frame_testbench.stream_cli.Orchestrator') as orchestrator, \
+                patch('frame_testbench.stream_cli.run_headset_cli') as bench, \
+                patch('frame_testbench.ugevr.run_process') as controller, patch('builtins.print'):
+            code = main(prefix + ['--prepared', '--replace-path', selected[0], '--experimental-steam-cef'])
+        self.assertEqual(code, 2)
+        orchestrator.assert_not_called()
+        bench.assert_not_called()
+        controller.assert_not_called()
+
     def test_standalone_stop_exit_code_requires_restoration_and_terminal_cleanup(self):
         from frame_testbench.stream_cli import main
         cases = [({'deployment_restored': 'true', 'cleanup_complete': 'true'}, 0),
@@ -371,6 +427,12 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(result.outcome, 'incomplete')
         self.assertFalse(result.association_verified)
         self.assertEqual((result.both_eye_evidence, result.input_forwarding_evidence), ('unknown', 'unknown'))
+        metadata = read_scalars(result.metadata())
+        self.assertEqual(metadata['stream_association'], 'observed')
+        self.assertEqual(metadata['peer_evidence'], 'unknown')
+        self.assertEqual(metadata['both_eye_evidence'], 'unknown')
+        self.assertEqual(metadata['input_forwarding_evidence'], 'unknown')
+        self.assertEqual(metadata['association_verified'], 'false')
 
     def test_stream_request_without_association_does_not_launch_game(self):
         from frame_testbench.steam_cef import StreamState
