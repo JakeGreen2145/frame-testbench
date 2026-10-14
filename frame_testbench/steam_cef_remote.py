@@ -15,6 +15,8 @@ PORT = 8080
 ERRORS = {'peer_missing', 'peer_ambiguous', 'peer_not_vr', 'unsafe_client_id',
           'store_unavailable', 'stream_call_unavailable', 'other_stream_active',
           'stream_already_active', 'peer_changed', 'dashboard_unavailable'}
+ERRORS |= {'ownership_lost', 'ownership_store_invalid', 'ownership_receipt_conflict',
+           'ownership_store_full', 'stop_call_unavailable'}
 DIAGNOSTIC_CODES = ERRORS | {
     'target_inventory_too_large', 'invalid_target_inventory', 'debug_target_missing_or_ambiguous',
     'invalid_debug_target', 'debug_target_not_loopback', 'handshake_too_large', 'handshake_refused',
@@ -82,6 +84,51 @@ def hide_expression(peer, client_id):
  if(typeof SteamClient?.OpenVR?.VROverlay?.HideDashboard!=='function')fail('dashboard_unavailable');
  return SteamClient.OpenVR.VROverlay.HideDashboard();
  })()""" % (json.dumps(peer), json.dumps(client_id), json.dumps(client_id))
+
+
+def receipt_expression(peer, client_id, nonce, claim=False):
+    # The row reference and private native argument tuple never leave this context.
+    return """(()=>{
+ const s=window.RemotePlayStore_SteamUI;const fail=c=>{throw Error('FTB:'+c)};
+ const ds=s?.devices?.filter(d=>d.clientName===%s);
+ if(ds?.length!==1||String(ds[0].clientId)!==%s)fail('peer_changed');
+ const rows=s.remoteClientStreams;const key=Symbol.for('frame-testbench.steam-cef.receipts.v1');
+ let receipts=window[key];const nonce=%s,claim=%s;
+ if(receipts!==undefined&&!(receipts instanceof Map))fail('ownership_store_invalid');
+ const selected=rows.filter(r=>String(r.m_clientid)===%s&&String(r.m_gameid)==='250820');
+ if(claim){
+  if(rows.length!==1||selected.length!==1||!ds[0].bCanStreamVR)fail('ownership_lost');
+  if(!receipts){receipts=new Map;Object.defineProperty(window,key,{value:receipts,configurable:true})}
+  for(const [n,record]of receipts)if(!rows.includes(record.row))receipts.delete(n);
+  if(receipts.has(nonce))fail('ownership_receipt_conflict');if(receipts.size>=64)fail('ownership_store_full');
+  const r=selected[0];receipts.set(nonce,{row:r,args:[r.m_unGroupID,r.m_steamid,r.m_gameid,r.m_clientid],stopRequested:false});
+ }
+ const record=receipts?.get(nonce),r=selected[0];
+ return {receipt_claimed:!!record&&r===record.row&&record.args.every((v,i)=>v===[r.m_unGroupID,r.m_steamid,r.m_gameid,r.m_clientid][i])};
+ })()""" % (json.dumps(peer), json.dumps(client_id), json.dumps(nonce),
+             'true' if claim else 'false', json.dumps(client_id))
+
+
+def disconnect_expression(peer, client_id, nonce):
+    return """(()=>{
+ const s=window.RemotePlayStore_SteamUI;const fail=c=>{throw Error('FTB:'+c)};
+ const ds=s?.devices?.filter(d=>d.clientName===%s);
+ if(ds?.length!==1||String(ds[0].clientId)!==%s||!ds[0].bCanStreamVR)fail('peer_changed');
+ const rows=s.remoteClientStreams,receipts=window[Symbol.for('frame-testbench.steam-cef.receipts.v1')];
+ const record=receipts instanceof Map?receipts.get(%s):undefined;
+ if(rows.length!==1||String(rows[0].m_clientid)!==%s||String(rows[0].m_gameid)!=='250820')fail('other_stream_active');
+ const r=rows[0],args=[r.m_unGroupID,r.m_steamid,r.m_gameid,r.m_clientid];
+ if(!record||record.row!==r||!record.args.every((v,i)=>v===args[i]))fail('ownership_lost');
+ if(record.stopRequested)return {request_issued:false};
+ if(typeof SteamClient?.RemotePlay?.StopRemoteClientStream!=='function')fail('stop_call_unavailable');
+ SteamClient.RemotePlay.StopRemoteClientStream(r.m_unGroupID,r.m_steamid,r.m_gameid,r.m_clientid);
+ record.stopRequested=true;return {request_issued:true};
+ })()""" % (json.dumps(peer), json.dumps(client_id), json.dumps(nonce), json.dumps(client_id))
+
+
+def release_receipt_expression(nonce):
+    return """(()=>{const key=Symbol.for('frame-testbench.steam-cef.receipts.v1');const map=window[key];
+    if(map instanceof Map){map.delete(%s);if(map.size===0)delete window[key]}return true})()""" % json.dumps(nonce)
 
 
 class CDP:
@@ -209,14 +256,19 @@ class CDP:
         raise ProbeError('evaluation_timeout')
 
 
-def operate(cdp, operation, peer, client_id=None, deadline_seconds=30, *, clock=time.monotonic, sleep=time.sleep):
+def operate(cdp, operation, peer, client_id=None, deadline_seconds=30, *, ownership_nonce=None,
+            clock=time.monotonic, sleep=time.sleep):
     state = cdp.evaluate(snapshot_expression(peer))
     if not isinstance(state, dict):
         raise ProbeError('invalid_state')
     if client_id is not None and state.get('client_id') != client_id:
         raise ProbeError('peer_changed')
     reply = dict(state, schema_version=1, operation=operation, request_issued=False,
-                 timed_out=False, dashboard_visible=None)
+                 timed_out=False, dashboard_visible=None, receipt_claimed=False,
+                 association_removed=False, windows_runtime_state='unknown')
+    if ownership_nonce is not None:
+        receipt = cdp.evaluate(receipt_expression(peer, state['client_id'], ownership_nonce))
+        reply['receipt_claimed'] = receipt.get('receipt_claimed') is True
     if operation == 'observe':
         return reply
     if state.get('can_stream_vr') is not True:
@@ -224,6 +276,8 @@ def operate(cdp, operation, peer, client_id=None, deadline_seconds=30, *, clock=
     if state.get('other_stream_active') is not False:
         raise ProbeError('other_stream_active')
     if operation == 'connect':
+        if ownership_nonce is None:
+            raise ProbeError('invalid_request')
         if state.get('stream_associated') or state.get('generic_session_active') or state.get('selected_session_active'):
             raise ProbeError('stream_already_active')
         request = cdp.evaluate(connect_expression(peer, state['client_id']))
@@ -240,6 +294,39 @@ def operate(cdp, operation, peer, client_id=None, deadline_seconds=30, *, clock=
             for key in ('client_id', 'can_stream_vr', 'stream_associated', 'other_stream_active'):
                 reply[key] = current.get(key)
             if current.get('stream_associated') is True:
+                receipt = cdp.evaluate(receipt_expression(peer, state['client_id'], ownership_nonce, True))
+                if receipt.get('receipt_claimed') is not True:
+                    raise ProbeError('ownership_lost')
+                reply['receipt_claimed'] = True
+                return reply
+            sleep(min(.25, max(0, deadline - clock())))
+        reply['timed_out'] = True
+        return reply
+    if operation == 'disconnect':
+        if ownership_nonce is None:
+            raise ProbeError('ownership_lost')
+        if state.get('stream_associated') is not True:
+            cdp.evaluate(release_receipt_expression(ownership_nonce))
+            reply['association_removed'] = True
+            return reply
+        if reply['receipt_claimed'] is not True:
+            raise ProbeError('ownership_lost')
+        request = cdp.evaluate(disconnect_expression(peer, state['client_id'], ownership_nonce))
+        if not isinstance(request, dict) or type(request.get('request_issued')) is not bool:
+            raise ProbeError('invalid_request_result')
+        reply['request_issued'] = request['request_issued']
+        deadline = clock() + deadline_seconds
+        while clock() < deadline:
+            current = cdp.evaluate(snapshot_expression(peer))
+            if current.get('client_id') != state['client_id']:
+                raise ProbeError('peer_changed')
+            if current.get('other_stream_active'):
+                raise ProbeError('other_stream_active')
+            reply['stream_associated'] = current.get('stream_associated') is True
+            if not reply['stream_associated']:
+                cdp.evaluate(release_receipt_expression(ownership_nonce))
+                reply['association_removed'] = True
+                reply['receipt_claimed'] = False
                 return reply
             sleep(min(.25, max(0, deadline - clock())))
         reply['timed_out'] = True
@@ -273,9 +360,10 @@ def operate(cdp, operation, peer, client_id=None, deadline_seconds=30, *, clock=
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--operation', choices=['observe', 'connect', 'hide-dashboard'], required=True)
+    parser.add_argument('--operation', choices=['observe', 'connect', 'hide-dashboard', 'disconnect'], required=True)
     parser.add_argument('--expected-peer', required=True)
     parser.add_argument('--client-id')
+    parser.add_argument('--ownership-nonce')
     parser.add_argument('--deadline-seconds', type=int, default=30)
     args = parser.parse_args(argv)
     cdp = None
@@ -283,8 +371,11 @@ def main(argv=None):
         if (not 1 <= args.deadline_seconds <= 30 or not 1 <= len(args.expected_peer) <= 128
                 or any(ord(c) < 32 for c in args.expected_peer)):
             raise ProbeError('invalid_request')
+        if args.ownership_nonce is not None and not re.fullmatch(r'[a-f0-9]{32}', args.ownership_nonce):
+            raise ProbeError('invalid_request')
         cdp = CDP()
-        result = operate(cdp, args.operation, args.expected_peer, args.client_id, args.deadline_seconds)
+        result = operate(cdp, args.operation, args.expected_peer, args.client_id, args.deadline_seconds,
+                         ownership_nonce=args.ownership_nonce)
         print(json.dumps(dict(result, ok=True), allow_nan=False))
         return 0
     except ProbeError as error:

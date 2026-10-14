@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -55,7 +57,7 @@ class ProviderTests(unittest.TestCase):
         self.assertIn('class CDP', calls[0][1])
 
     def test_new_associated_stream_is_owned_but_existing_stream_is_reused(self):
-        responses = [reply(), reply('connect', request_issued=True, stream_associated=True)]
+        responses = [reply(), reply('connect', request_issued=True, stream_associated=True, receipt_claimed=True)]
         provider = SteamCEF('frame', 'pc', runner=lambda *_: (0, json.dumps(responses.pop(0))))
         self.assertTrue(provider.connect().stream_associated)
         self.assertTrue(provider.owns_stream)
@@ -66,7 +68,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(provider.last_request, 'reused')
         self.assertFalse(provider.owns_stream)
         self.assertEqual(len(reused_calls), 1)
-        self.assertEqual(provider.disconnect(), 'unavailable')
+        self.assertEqual(provider.disconnect().outcome, 'unowned')
         self.assertEqual(len(reused_calls), 1)
 
     def test_other_stream_or_missing_capability_blocks_before_mutation(self):
@@ -112,6 +114,31 @@ class ProviderTests(unittest.TestCase):
         process.assert_not_called()
         with self.assertRaises(ProviderError):
             ssh_worker([sys.executable, '-c', 'print("x" * 65537)'], 'x', 3, threading.Event())
+
+    def test_owned_disconnect_reports_association_only_and_receipt_is_private(self):
+        responses = [reply(), reply('connect', request_issued=True, stream_associated=True, receipt_claimed=True),
+                     reply('disconnect', request_issued=True, association_removed=True)]
+        provider = SteamCEF('frame', 'pc', runner=lambda *_: (0, json.dumps(responses.pop(0))))
+        provider.connect()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'receipt.yaml'
+            provider.save_receipt(path)
+            self.assertIn('ownership_nonce:', path.read_text())
+            self.assertNotIn('steamid', path.read_text())
+            restored = SteamCEF('frame', 'pc', runner=lambda *_: (
+                0, json.dumps(reply(stream_associated=True, receipt_claimed=True))))
+            restored.load_receipt(path)
+            self.assertTrue(restored.owns_stream)
+            self.assertEqual(restored._ownership_nonce, provider._ownership_nonce)
+            expired = SteamCEF('frame', 'pc', runner=lambda *_: (
+                0, json.dumps(reply(stream_associated=True, receipt_claimed=False))))
+            with self.assertRaises(ProviderError):
+                expired.load_receipt(path)
+        cleanup = provider.disconnect()
+        self.assertEqual(cleanup.outcome, 'association_removed')
+        self.assertTrue(cleanup.association_removed)
+        self.assertEqual(cleanup.windows_runtime_state, 'unknown')
+        self.assertFalse(provider.owns_stream)
 
 
 @unittest.skipUnless(shutil.which('node'), 'Node is needed only for controlled guard execution')
@@ -165,6 +192,26 @@ class GuardTests(unittest.TestCase):
         result = self.execute(remote.hide_expression('pc', CLIENT), streams=[dict(m_clientid=CLIENT, m_gameid='250820')])
         self.assertEqual(result['calls'], ['hide'])
 
+    def test_owned_stop_uses_private_row_and_rejects_replacement_or_raw_argument_change(self):
+        nonce = 'a' * 32
+        program = "const calls=[];const row={m_unGroupID:0,m_steamid:'fixture-private',m_gameid:'250820',m_clientid:" + json.dumps(CLIENT) + "};"
+        program += "const window={RemotePlayStore_SteamUI:{devices:[{clientName:'pc',clientId:" + json.dumps(CLIENT) + ",bCanStreamVR:true}],remoteClientStreams:[row]}};"
+        program += "const SteamClient={RemotePlay:{StopRemoteClientStream:(...args)=>calls.push(args)}};"
+        program += 'const claim=' + remote.receipt_expression('pc', CLIENT, nonce, True) + ';'
+        program += 'const first=' + remote.disconnect_expression('pc', CLIENT, nonce) + ';'
+        program += 'const repeated=' + remote.disconnect_expression('pc', CLIENT, nonce) + ';'
+        program += "window.RemotePlayStore_SteamUI.remoteClientStreams=[{...row}];let replacement='';try{" + remote.disconnect_expression('pc', CLIENT, nonce) + "}catch(e){replacement=e.message};"
+        program += "window.RemotePlayStore_SteamUI.remoteClientStreams=[row];row.m_steamid='changed';let changed='';try{" + remote.disconnect_expression('pc', CLIENT, nonce) + "}catch(e){changed=e.message};"
+        program += 'console.log(JSON.stringify({claim,first,repeated,replacement,changed,calls}));'
+        completed = subprocess.run(['node', '-e', program], capture_output=True, text=True, timeout=5, check=True)
+        data = json.loads(completed.stdout)
+        self.assertTrue(data['claim']['receipt_claimed'])
+        self.assertTrue(data['first']['request_issued'])
+        self.assertFalse(data['repeated']['request_issued'])
+        self.assertEqual(data['replacement'], 'FTB:ownership_lost')
+        self.assertEqual(data['changed'], 'FTB:ownership_lost')
+        self.assertEqual(data['calls'], [[0, 'fixture-private', '250820', CLIENT]])
+
 
 class FakeCDP:
     def __init__(self, values):
@@ -178,16 +225,19 @@ class FakeCDP:
 class OperationTests(unittest.TestCase):
     def test_single_request_polls_association_and_timeout_keeps_unknown(self):
         empty = reply()
-        cdp = FakeCDP([empty, {'request_issued': True}, empty, reply(stream_associated=True)])
+        cdp = FakeCDP([empty, {'receipt_claimed': False}, {'request_issued': True}, empty,
+                       reply(stream_associated=True), {'receipt_claimed': True}])
         now = [0.0]
         data = remote.operate(cdp, 'connect', 'pc', CLIENT, 1,
+                              ownership_nonce='a' * 32,
                               clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
         self.assertTrue(data['stream_associated'])
         self.assertTrue(data['request_issued'])
         self.assertEqual(sum('SteamClient.Apps.StreamGame(' in expr for expr, _ in cdp.expressions), 1)
         now[0] = 0
-        cdp = FakeCDP([empty, {'request_issued': True}, empty])
+        cdp = FakeCDP([empty, {'receipt_claimed': False}, {'request_issued': True}, empty])
         data = remote.operate(cdp, 'connect', 'pc', CLIENT, .1,
+                              ownership_nonce='a' * 32,
                               clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
         self.assertTrue(data['timed_out'])
         self.assertFalse(data['stream_associated'])
@@ -200,6 +250,18 @@ class OperationTests(unittest.TestCase):
         self.assertIs(data['dashboard_visible'], False)
         self.assertEqual(sum('return SteamClient.OpenVR.VROverlay.HideDashboard();' in expr for expr, _ in cdp.expressions), 1)
         self.assertTrue(all(awaited for expr, awaited in cdp.expressions if 'IsDashboardVisible' in expr))
+
+    def test_disconnect_requires_receipt_and_polls_only_specific_association(self):
+        cdp = FakeCDP([reply(stream_associated=True), {'receipt_claimed': True},
+                       {'request_issued': True}, reply(stream_associated=False), True])
+        data = remote.operate(cdp, 'disconnect', 'pc', CLIENT, 1, ownership_nonce='a' * 32)
+        self.assertTrue(data['association_removed'])
+        self.assertEqual(data['windows_runtime_state'], 'unknown')
+        missing = FakeCDP([reply(stream_associated=True), {'receipt_claimed': False}])
+        with self.assertRaises(remote.ProbeError) as caught:
+            remote.operate(missing, 'disconnect', 'pc', CLIENT, 1, ownership_nonce='a' * 32)
+        self.assertEqual(str(caught.exception), 'ownership_lost')
+        self.assertEqual(len(missing.expressions), 2)
 
 
 class FakeSocket:

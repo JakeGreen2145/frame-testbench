@@ -16,7 +16,9 @@ After a new request, the provider polls `RemotePlayStore_SteamUI.remoteClientStr
 
 Dashboard dismissal uses the observed no-argument `SteamClient.OpenVR.VROverlay.HideDashboard()` control. It requires only the selected SteamVR stream, issues at most one hide call, awaits its result and polls the awaited `IsDashboardVisible` query. The observed native request propagated after its initial response, so a completed request cannot itself mean the dashboard is hidden.
 
-No automated disconnect control is enabled in this version. `disconnect` returns `unavailable` without contacting the headset. A coordinated private probe of the shipped stop control removed the specific peer/game stream row through twenty seconds, but Windows still exposed a connected HMD afterward. Therefore association removal and host runtime disconnection must be reported separately. A future verified implementation must stop only a newly requested, owned and still matching stream. A reused stream must remain intact. Ending a Testbench lease or stopping the game does not imply stream disconnection.
+Owned disconnect requires a fresh private ownership receipt. After a new connection request produces one specific stream row, the provider records that exact row object and its raw native argument tuple in a private, bounded receipt map inside SharedJSContext. Only the opaque nonce leaves that context. A fresh stop expression checks the expected peer, sole matching stream, the exact row object and unchanged raw arguments before one `StopRemoteClientStream` call. Replaced rows, changed arguments, another stream, missing receipts and reused streams are refused. A repeated pending cleanup polls without issuing another stop call.
+
+The result reports `association_removed` or `pending`; its Windows runtime state remains `unknown`. A coordinated private probe removed the specific row through twenty seconds. Windows initially still exposed a connected HMD, then independently reported its runtime closed after propagation. Association removal and host runtime closure must therefore remain separate observations. Ending a Testbench lease or stopping the game proves neither.
 
 The provider does not kill or restart a waiting Windows SteamVR runtime. A manual probe showed that an already waiting directly launched runtime could prevent the request from connecting. That condition needs an explicit ownership-aware remedy in the host workflow. No automatic process or service cleanup is inferred from it.
 
@@ -35,11 +37,20 @@ frame-testbench-steam --host frame --expected-peer my-paired-pc --experimental c
 frame-testbench-steam --host frame --expected-peer my-paired-pc --experimental hide-dashboard
 ```
 
-The checkout equivalent is `python -m frame_testbench.steam_cef`. Its output is a bounded flat YAML mapping. A request flag and specific stream association cannot establish game image or input evidence. They leave both-eye and Windows input results unknown. Exit4 reports a timed-out observation or unavailable disconnect, and exit2 reports validation or transport failure.
+To retain ownership across standalone CLI processes, select a new private `--receipt-file` during connection and use it for explicit disconnect:
+
+```text
+frame-testbench-steam --host frame --expected-peer my-paired-pc --experimental --receipt-file artifacts/owned-stream.yaml connect
+frame-testbench-steam --host frame --expected-peer my-paired-pc --experimental --receipt-file artifacts/owned-stream.yaml disconnect
+```
+
+The receipt is an opaque control handle, stays local and is not printed or included in ordinary result metadata. It contains no account IDs. Loading it requires a fresh context receipt match; a local file alone grants no ownership. Reuse creates no receipt, and an unrelated existing receipt file is not replaced. A missing receipt produces an unowned result without a stop call.
+
+The checkout equivalent is `python -m frame_testbench.steam_cef`. Its output is a bounded flat YAML mapping. A request flag and specific stream association cannot establish game image or input evidence. They leave both-eye and Windows input results unknown. Exit4 reports a timed-out observation, pending cleanup or unowned disconnect, and exit2 reports validation or transport failure.
 
 `SteamCEF` is the typed Python provider. `Orchestrator(stream_provider=provider)` begins its lease, requests or reuses the stream, then launches the external UGEVR controller. A timed-out stream association stops this path before game launch. The orchestrator records the experimental mode, request, uint64 client ID, specific association, ownership and dashboard visibility separately. Independent observers still own both-eye run markers and Windows action receipt. Capture chunks recheck stream association.
 
-SSH runs a fixed Python worker supplied by this package on stdin. The worker has only `observe`, `connect` and `hide-dashboard` operations and uses the existing loopback context. Arguments use explicit SSH host validation and shell quoting. Replies contain selected capability/state flags and opaque client identity only. Diagnostic codes exclude native exception text and arbitrary page output. Socket reads have wall-clock deadlines and size limits; the SSH child has a deadline and cancellation. Cancellation can leave a request outcome unknown. It never manufactures a stopped stream or kills SteamVR to compensate.
+SSH runs a fixed Python worker supplied by this package on stdin. The worker has only `observe`, `connect`, `hide-dashboard` and receipt-guarded `disconnect` operations and uses the existing loopback context. Arguments use explicit SSH host validation and shell quoting. Replies contain selected capability/state flags and opaque client identity only. Diagnostic codes exclude native exception text and arbitrary page output. Socket reads have wall-clock deadlines and size limits; the SSH child has a deadline and cancellation. Cancellation can leave a request outcome unknown. It never manufactures a stopped stream or kills SteamVR to compensate.
 
 ## Evidence and limits
 

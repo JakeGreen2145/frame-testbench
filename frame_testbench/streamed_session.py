@@ -42,6 +42,8 @@ class RunResult:
     host_cleanup_reason: str = ''
     headset_cleanup: str = 'not_started'
     stream_cleanup: str = 'unavailable'
+    stream_association_removed: bool = False
+    stream_windows_runtime: str = 'unknown'
     requested_seconds: int = 0
     recorded_seconds: int = 0
     error: str = ''
@@ -278,8 +280,22 @@ class Orchestrator:
                         result.outcome = 'failed'
             if self.stream_provider is not None:
                 result.stream_request = self.stream_provider.last_request
-                # No source-backed disconnect is claimed until its physical probe is validated.
+                # Only a newly owned receipt may stop its stream. Host runtime has a separate observer.
                 if self.stream_provider.owns_stream:
-                    result.stream_cleanup = self.stream_provider.disconnect()
+                    try:
+                        cleanup = self.stream_provider.disconnect()
+                        if isinstance(cleanup, str):
+                            result.stream_cleanup = cleanup
+                        else:
+                            result.stream_cleanup = cleanup.outcome
+                            result.stream_association_removed = cleanup.association_removed
+                            result.stream_windows_runtime = cleanup.windows_runtime_state
+                    except Exception as error:
+                        result.stream_cleanup = 'failed'
+                        result.error += '; stream cleanup: ' + str(error)
+                        if result.outcome != 'cancelled':
+                            result.outcome = 'failed'
+                elif result.stream_request == 'reused':
+                    result.stream_cleanup = 'unowned'
             (directory / 'session.yaml').write_text(result.metadata(), encoding='utf-8')
         return result
