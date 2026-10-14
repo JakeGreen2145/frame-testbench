@@ -1,0 +1,162 @@
+"""Fixed-window passive observer against controlled public SDK, never SteamVR."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+import unittest
+
+from test_observe import fake_source
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def action_fixture():
+    return fake_source({
+        'GetCurrentSceneFocusProcess': 'return updates<24?777:888;',
+        'IsDashboardVisible': 'return updates>=35;',
+        'GetApplicationKeyByProcessId': '''if(unAppKeyBufferLen!=256) abort();
+            log("app_key");
+            if(updates==6){memset(pchAppKeyBuffer,'x',256);return VRApplicationError_None;}
+            if(updates==7)return VRApplicationError_BufferTooSmall;
+            strcpy(pchAppKeyBuffer,unProcessId==777?"vrlink.client":"other.scene");return VRApplicationError_None;''',
+        'GetDigitalActionData': '''if(unActionDataSize!=sizeof(*pActionData))abort();
+            const auto &name=check_action(action,ulRestrictToDevice);
+            if(name!="/actions/observe/in/right_a_click")abort();
+            *pActionData={};pActionData->bActive=updates<30;
+            pActionData->bState=updates>=4 && updates<=10;pActionData->bChanged=updates==4 || updates==11;
+            pActionData->fUpdateTime=-.01f;pActionData->activeOrigin=updates<20?1107:1104;
+            return VRInputError_None;''',
+        'GetAnalogActionData': '''if(unActionDataSize!=sizeof(*pActionData))abort();
+            const auto &name=check_action(action,ulRestrictToDevice);
+            if(name!="/actions/observe/in/right_thumbstick_position")abort();
+            *pActionData={};pActionData->bActive=updates<30;pActionData->activeOrigin=1107;
+            pActionData->x=updates==12?std::numeric_limits<float>::quiet_NaN():.35f;pActionData->y=-.65f;
+            return VRInputError_None;''',
+        'IsInputAvailable': 'return updates<30;',
+        'GetStringTrackedDeviceProperty': '''if(prop!=Prop_SerialNumber_String || unBufferSize!=256)abort();
+            if(unDeviceIndex!=2 && unDeviceIndex!=4 && unDeviceIndex!=7 && unDeviceIndex!=63)abort();
+            if(pError)*pError=TrackedProp_Success;
+            log("serial_256");
+            if(updates==16 && unDeviceIndex==7)return 257;
+            const char *s=unDeviceIndex==7 || (updates==17 && unDeviceIndex==63)?"frame_testbench_right":"physical-controller";
+            auto size=uint32_t(strlen(s)+1);memcpy(pchValue,s,size);return size;''',
+        'GetDeviceToAbsoluteTrackingPose': '''if(eOrigin!=TrackingUniverseStanding || fPredictedSecondsToPhotonsFromNow!=0 || unTrackedDevicePoseArrayCount!=64)abort();
+            for(unsigned i=0;i<64;i++){auto &p=pTrackedDevicePoseArray[i];p={};p.bDeviceIsConnected=p.bPoseIsValid=i==7;
+            p.eTrackingResult=TrackingResult_Running_OK;p.mDeviceToAbsoluteTracking=matrix(0);p.mDeviceToAbsoluteTracking.m[0][3]=.27f;}''',
+    })
+
+
+class ControllerActionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        subprocess.run(['sh', str(ROOT / 'scripts/build-controller-actions.sh')], cwd=ROOT, check=True)
+        cls.tmp = tempfile.TemporaryDirectory(prefix='controller-actions-', dir=ROOT / 'build')
+        cls.work = Path(cls.tmp.name)
+        source = cls.work / 'fake.cpp'
+        source.write_text(action_fixture())
+        cls.library = cls.work / 'libfakeopenvr.so'
+        subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-shared', '-fPIC', '-pthread',
+                        '-I', str(ROOT / 'vendor'), str(source), '-o', str(cls.library)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.case = tempfile.TemporaryDirectory(dir=self.work)
+        self.path = Path(self.case.name)
+        self.log = self.path / 'calls.log'
+        self.env = dict(os.environ, OPENVR_API_LIBRARY=str(self.library), FAKE_LOG=str(self.log), FAKE_MODE='', FAKE_CONTROLLER_PROPERTIES='1')
+
+    def tearDown(self):
+        self.case.cleanup()
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def run_observer(self, args=None, mode='', code=0):
+        self.env['FAKE_MODE'] = mode
+        result = subprocess.run([str(ROOT / 'build/frame-controller-actions'), *(args if args is not None else [str(ROOT / 'resources/input-actions.json')])],
+                                env=self.env, capture_output=True, text=True, timeout=23)
+        self.assertEqual(result.returncode, code, result.stderr)
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def test_one_client_retains_timeline_origins_context_and_unknown_receipt(self):
+        start = time.monotonic()
+        records = self.run_observer()
+        self.assertLess(time.monotonic() - start, 19)
+        self.assertEqual(records[0]['event'], 'start')
+        self.assertEqual(records[-1]['event'], 'end')
+        samples = [row for row in records if row['event'] == 'sample']
+        self.assertGreater(len(samples), 100)
+        self.assertLessEqual(len(samples), 300)
+        self.assertEqual([row['sequence'] for row in samples], list(range(len(samples))))
+        self.assertEqual(len({row['observer_pid'] for row in records if 'observer_pid' in row}), 1)
+        self.assertTrue(all(row['input_receipt'] == 'unknown' for row in records))
+        self.assertEqual(records[-1]['sample_count'], len(samples))
+        self.assertTrue(any(row['right_a']['value'] is True and row['right_a']['origin']['device_index'] == 7 for row in samples))
+        self.assertTrue(any(row['right_a']['value'] is False and row['right_a']['origin']['device_index'] == 4 for row in samples if row['right_a']['origin']))
+        self.assertTrue(any(row['right_a']['active'] is False and row['right_a']['value'] is None and row['right_a']['origin'] is None for row in samples))
+        self.assertTrue(any(row['scene_pid_before'] != row['scene_pid_after'] for row in samples))
+        self.assertTrue(any(row['dashboard_after'] and not row['input_available'] for row in samples))
+        self.assertTrue(any(row['input_available_before'] and not row['input_available'] for row in samples))
+        self.assertTrue(any(row['scene_app_key']['value'] is None and row['scene_app_key']['validation_error'] for row in samples))
+        self.assertTrue(any(row['scene_app_key']['error'] == 200 for row in samples))
+        self.assertTrue(any(row['axis0']['value'] == [None, -0.6499999762] for row in samples))
+        self.assertTrue(any(row['producer']['match_count'] == 2 and row['producer']['device'] is None for row in samples))
+        self.assertTrue(any(row['right_a']['origin'] and row['right_a']['origin']['serial']['error'] == 3
+                            and row['right_a']['origin']['serial']['value'] is None for row in samples))
+        self.assertTrue(all(isinstance(row['right_a']['origin']['handle'], str) for row in samples if row['right_a']['origin']))
+        self.assertTrue(samples[0]['producer']['device']['standing_pose']['valid'])
+        self.assertTrue(samples[0]['producer']['device']['standing_pose']['connected'])
+        calls = self.calls()
+        self.assertEqual(calls.count('init_background'), 1)
+        self.assertEqual(calls.count('manifest'), 1)
+        self.assertEqual(calls.count('shutdown'), 1)
+        self.assertEqual(calls.count('update_actions'), len(samples))
+        self.assertFalse(any(line.startswith('set_') for line in calls))
+
+    def test_shutdown_deadline_keeps_flushed_samples_and_reports_unknown(self):
+        start = time.monotonic()
+        records = self.run_observer(mode='shutdown_hang', code=124)
+        self.assertLess(time.monotonic() - start, 22)
+        samples = [row for row in records if row['event'] == 'sample']
+        self.assertGreater(len(samples), 100)
+        self.assertEqual(records[-1]['event'], 'error')
+        self.assertEqual(records[-1]['error'], 'whole_process_deadline')
+        self.assertEqual(records[-1]['outcome'], 'unknown')
+        self.assertFalse(any(row['event'] == 'end' for row in records))
+        self.assertNotIn('shutdown', self.calls())
+
+    def test_bad_manifest_and_binding_files_fail_before_sdk(self):
+        manifest = self.path / 'input-actions.json'
+        binding = self.path / 'frame-controller-bindings.json'
+        for resource in (manifest, binding):
+            shutil.copyfile(ROOT / 'resources' / resource.name, resource)
+        for which in ('manifest', 'binding'):
+            with self.subTest(which=which):
+                target = manifest if which == 'manifest' else binding
+                original = target.read_bytes()
+                target.write_bytes(original + b' ')
+                records = self.run_observer(args=[str(manifest)], code=1)
+                target.write_bytes(original)
+                self.assertEqual(records[0]['stage'], 'validation')
+                self.assertEqual(records[0]['error'], 'action_resource_pin_mismatch')
+                self.assertEqual(self.calls(), [])
+        manifest.unlink()
+        manifest.symlink_to(ROOT / 'resources/input-actions.json')
+        self.run_observer(args=[str(manifest)], code=1)
+        self.assertEqual(self.calls(), [])
+
+    def test_wrong_arguments_fail_before_sdk(self):
+        self.run_observer(args=[], code=1)
+        self.run_observer(args=['relative/input-actions.json'], code=1)
+        self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--duration', '1'], code=1)
+        self.assertEqual(self.calls(), [])
+
+
+if __name__ == '__main__':
+    unittest.main()

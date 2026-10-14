@@ -41,7 +41,7 @@ def png():
             + chunk(b'IDAT', zlib.compress(b'\0\xff\0\0')) + chunk(b'IEND', b''))
 
 
-def fake_source():
+def fake_source(extra_overrides=None):
     header = (ROOT / 'vendor/openvr.h').read_text()
     # Derive actual vtable signatures, never guessed ABI layouts. Every method
     # outside the explicit read/capture/settings/debug contract aborts.
@@ -196,6 +196,7 @@ def fake_source():
             if(mode("debug_large")) return unResponseBufferSize+1;
             if(unResponseBufferSize>=n) memcpy(pchResponseBuffer,s,n); return n;''',
     }
+    overrides.update(extra_overrides or {})
     source = '''#include "openvr.h"
 #include <cstdlib>
 #include <cstring>
@@ -233,7 +234,7 @@ void check_setting(const char *s,const char *k){if(std::string(s)!="power" || st
 HmdMatrix34_t matrix(float x){HmdMatrix34_t m={};for(int i=0;i<3;i++)m.m[i][i]=1;m.m[0][3]=x;return m;}
 '''
     source += 'std::vector<unsigned char> image={' + ','.join(str(b) for b in png()) + '};\n'
-    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput'):
+    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput', 'IVROverlay', 'IVRApplications'):
         match = re.search(r'class\s+' + interface + r'\s*\{(.*?)\n\s*\};', header, re.DOTALL)
         assert match is not None, interface
         body = match.group(1)
@@ -254,12 +255,12 @@ uint32_t VR_InitInternal2(EVRInitError *e,EVRApplicationType t,const char*){
  if(mode("hang")) for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));
  *e=mode("init_error")?VRInitError_Init_HmdNotFound:VRInitError_None;return 1;
 }
-void VR_ShutdownInternal(){log("shutdown_enter");if(worker.joinable()) worker.join();log("shutdown");printf("shutdown noise\\n");}
+void VR_ShutdownInternal(){log("shutdown_enter");if(mode("shutdown_hang")) for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));if(worker.joinable()) worker.join();log("shutdown");printf("shutdown noise\\n");}
 bool VR_IsInterfaceVersionValid(const char *v){log(v);return !mode("bad_version");}
 void *VR_GetGenericInterface(const char *v,EVRInitError *e){*e=VRInitError_None;
  if(mode("missing_interface")){*e=VRInitError_Init_InterfaceNotFound;return nullptr;}
 '''
-    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput'):
+    for interface in ('IVRSystem', 'IVRCompositor', 'IVRSettings', 'IVRScreenshots', 'IVRDebug', 'IVRInput', 'IVROverlay', 'IVRApplications'):
         source += f'if(std::string(v)=={interface}_Version) return &object{interface};\n'
     return source + '*e=VRInitError_Init_InterfaceNotFound;return nullptr;}\n}\n'
 
