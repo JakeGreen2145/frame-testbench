@@ -40,6 +40,23 @@ Trigger mode adds `trigger_diagnostic=true` to the start record and `right_trigg
 
 The trigger scalar's local action identity does not establish a Windows legacy axis index, its type or original game input. Those remain independent receiver observations. Existing mutation coordinators keep their unchanged default sampler. Any explicitly selected trigger coordinator must require a fully active exact-origin neutral trigger baseline and keep receipt unknown until a separately verified receiver observes the bounded scalar and its release. The observer produces no input.
 
+## Optional dual-stick observation
+
+`--dual-stick` resolves the existing `/actions/observe/in/left_thumbstick_position` and `/user/hand/left` in the same SDK lifetime. It retains right A and right thumbstick reads through the existing right source. It changes no resources, pins, bindings, roles or producer input. Default mode and standalone `--trigger` mode make no left action/source query and emit no left fields.
+
+```sh
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --dual-stick > PRIVATE_FRESH_DUAL_STICK.jsonl
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --dual-stick --trigger --bindings > PRIVATE_FRESH_BINDINGS.jsonl
+```
+
+The start record adds `dual_stick_diagnostic=true`; samples add `left_axis0` and `left_producer`. The left action has its own native error, active flag, XY vector and actual origin. Inactive actions have `active=false` with null vector/origin; SDK errors have null active/vector/origin. Each nonfinite vector component remains null. Left and right source handles must be nonzero and distinct; a zero or aliased left action handle fails setup before sampling.
+
+Only dual-stick mode adds actual device class/role and index validation to action origins, including the existing right records. An out-of-range index stays null with `device_index_out_of_range`; SDK failures retain their native error and null device fields. Origin and device-path handles remain uint64 decimal strings. Foreign origins, invalid roles, generic trackers and failed serial reads remain visible as observations. A left-restricted query is not proof of a left-controller origin; compare its index, class, actual role and bounded serial with the producer separately.
+
+`left_producer` identifies the exact synthetic-left serial among the same at-most-64 controller indices, records actual role and connected/valid standing pose, and selects no device when missing or duplicated. Producer lookup performs one bounded scan for each side; no retries or additional SDK client are introduced. Sequential producer/origin reads are not an atomic identity snapshot.
+
+With `--bindings`, the left action is included at the existing sample sequences 0, 100 and 200. At most four actions are queried per sequence when all options are selected, using the same fixed 16-binding/64-origin buffers. The 15-second, 20Hz, 300-sample window and whole-process 20-second deadline remain unchanged. Existing mutation coordinators do not opt into this mode. Receipt and forwarding stay unknown; separate Windows and original-game observations are required.
+
 The known Testbench synthetic-right producer is independently identified by exact serial among at most64 controller-class devices each sample. Its current actual role and standing connected/valid pose are recorded. Missing or duplicate identities produce no selected producer. Each serial/app-key read uses one256-byte buffer without retries; malformed/error strings remain unknown. Serial identity is an experimental test correlation and does not identify a remote Windows receiver or game consumer.
 
 `IsInputAvailable` applies to this observer application's input context. It does not report raw component validity. A hand-restricted action can select a physical controller or change origins; the action origin must match the recorded synthetic producer in the same window. `input_receipt` and `controller_forwarding` always stay unknown. The helper emits observations, never a readiness marker, producer action, gameplay pass or physical gate.
