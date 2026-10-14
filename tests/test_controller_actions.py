@@ -171,6 +171,8 @@ class ControllerActionTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 19)
         self.assertEqual(records[0]['event'], 'start')
         self.assertNotIn('right_b_diagnostic', records[0])
+        self.assertNotIn('head_pose_diagnostic', records[0])
+        self.assertTrue(all('head_pose' not in row for row in records))
         self.assertTrue(all('right_b' not in row for row in records))
         self.assertEqual(records[-1]['event'], 'end')
         samples = [row for row in records if row['event'] == 'sample']

@@ -19,11 +19,13 @@ constexpr unsigned max_samples = 300;
 constexpr auto duration = std::chrono::seconds(15);
 constexpr auto interval = std::chrono::milliseconds(50);
 constexpr uint32_t device_limit = std::min<uint32_t>(64, vr::k_unMaxTrackedDeviceCount);
+static_assert(vr::k_unTrackedDeviceIndex_Hmd < device_limit, "HMD index must fit the existing pose array");
 const char *stage = "validation";
 bool binding_diagnostics = false;
 bool trigger_diagnostic = false;
 bool dual_stick_diagnostic = false;
 bool right_b_diagnostic = false;
+bool head_pose_diagnostic = false;
 void timed_out(int) {
     constexpr char message[] = "{\"event\":\"error\",\"schema_version\":1,\"error\":\"whole_process_deadline\",\"outcome\":\"unknown\",\"input_receipt\":\"unknown\"}\n";
     const auto ignored = write(output_fd, message, sizeof(message) - 1);
@@ -107,6 +109,64 @@ std::string pose(const vr::TrackedDevicePose_t &value) {
     out << "]}";
     return out.str();
 }
+struct HeadObservation {
+    vr::ETrackedDeviceClass class_before = vr::TrackedDeviceClass_Invalid, class_after = vr::TrackedDeviceClass_Invalid;
+    bool class_before_returned = false, class_after_returned = false, pose_returned = false;
+    vr::TrackedDevicePose_t value{};
+    std::chrono::steady_clock::time_point started, completed;
+    std::chrono::system_clock::time_point utc_started, utc_completed;
+    const char *query_error = nullptr;
+    void begin(vr::IVRSystem *system) {
+        started = std::chrono::steady_clock::now(); utc_started = std::chrono::system_clock::now();
+        try { class_before = system->GetTrackedDeviceClass(vr::k_unTrackedDeviceIndex_Hmd); class_before_returned = true; }
+        catch (...) { query_error = "head_class_before_query_exception"; }
+    }
+    void end(vr::IVRSystem *system) {
+        try { class_after = system->GetTrackedDeviceClass(vr::k_unTrackedDeviceIndex_Hmd); class_after_returned = true; }
+        catch (...) { if (!query_error) query_error = "head_class_after_query_exception"; }
+        completed = std::chrono::steady_clock::now(); utc_completed = std::chrono::system_clock::now();
+    }
+    std::string json(bool context_unchanged) const {
+        bool finite = pose_returned;
+        if (pose_returned) for (const auto &row : value.mDeviceToAbsoluteTracking.m)
+            for (float component : row) finite = finite && std::isfinite(component);
+        const bool correct_class = class_before_returned && class_after_returned
+            && class_before == vr::TrackedDeviceClass_HMD && class_after == vr::TrackedDeviceClass_HMD;
+        const char *reason = query_error ? query_error : !correct_class ? "head_class_unavailable_or_changed"
+            : !pose_returned ? "head_pose_query_unavailable" : !value.bDeviceIsConnected ? "head_disconnected"
+            : !value.bPoseIsValid ? "head_pose_invalid" : !finite ? "head_matrix_nonfinite" : nullptr;
+        std::ostringstream out;
+        out << "{\"device_index\":" << vr::k_unTrackedDeviceIndex_Hmd
+            << ",\"tracking_space\":\"standing\",\"prediction_seconds\":0,\"pose_api_error\":null"
+            << ",\"pose_query_returned\":" << boolean(pose_returned)
+            << ",\"class_before\":" << (class_before_returned ? std::to_string(class_before) : "null")
+            << ",\"class_after\":" << (class_after_returned ? std::to_string(class_after) : "null")
+            << ",\"query_error\":" << (query_error ? quote(query_error) : "null")
+            << ",\"sdk_pose_available\":" << boolean(reason == nullptr)
+            << ",\"unavailable_reason\":" << (reason ? quote(reason) : "null")
+            << ",\"context_unchanged\":" << boolean(context_unchanged)
+            << ",\"query_started_utc_unix_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(utc_started.time_since_epoch()).count()
+            << ",\"query_completed_utc_unix_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(utc_completed.time_since_epoch()).count()
+            << ",\"query_started_monotonic_ns\":" << quote(std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count()))
+            << ",\"query_completed_monotonic_ns\":" << quote(std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(completed.time_since_epoch()).count()))
+            << ",\"connected\":" << (pose_returned ? boolean(value.bDeviceIsConnected) : "null")
+            << ",\"valid\":" << (pose_returned ? boolean(value.bPoseIsValid) : "null")
+            << ",\"tracking_result\":" << (pose_returned ? std::to_string(value.eTrackingResult) : "null")
+            << ",\"matrix_finite\":" << (pose_returned ? boolean(finite) : "null") << ",\"matrix\":";
+        if (!pose_returned) out << "null";
+        else {
+            out << '[';
+            for (int row = 0; row < 3; ++row) {
+                if (row) out << ',';
+                out << '[';
+                for (int col = 0; col < 4; ++col) { if (col) out << ','; number(out, value.mDeviceToAbsoluteTracking.m[row][col]); }
+                out << ']';
+            }
+            out << ']';
+        }
+        out << '}';return out.str();
+    }
+};
 std::string producer(vr::IVRSystem *system, const std::array<vr::TrackedDevicePose_t, device_limit> &poses,
                      const char *expected_serial = "frame_testbench_right") {
     unsigned matches = 0;
@@ -260,7 +320,15 @@ unsigned observe(frame_observe::Sdk &sdk) {
         const bool trigger_active = trigger_diagnostic && trigger_error == vr::VRInputError_None && trigger_data.bActive;
         const bool left_active = dual_stick_diagnostic && left_error == vr::VRInputError_None && left_data.bActive;
         std::array<vr::TrackedDevicePose_t, device_limit> poses{};
-        system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses.data(), poses.size());
+        HeadObservation head;
+        if (head_pose_diagnostic) {
+            head.begin(system);
+            try {
+                system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses.data(), poses.size());
+                head.value = poses[vr::k_unTrackedDeviceIndex_Hmd];head.pose_returned = true;
+            } catch (...) { if (!head.query_error) head.query_error = "head_pose_query_exception"; }
+            head.end(system);
+        } else system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses.data(), poses.size());
         const auto producer_value = producer(system, poses);
         const auto left_producer = dual_stick_diagnostic ? producer(system, poses, "frame_testbench_left") : "null";
         const auto b_origin = b_active ? origin(input, system, b_data.activeOrigin, true) : "null";
@@ -316,6 +384,8 @@ unsigned observe(frame_observe::Sdk &sdk) {
             if (left_active) { out << '['; number(out, left_data.x); out << ','; number(out, left_data.y); out << ']'; } else out << "null";
             out << ",\"origin\":" << left_origin << '}';
         }
+        if (head_pose_diagnostic) out << ",\"head_pose\":" << head.json(scene_before == scene_after
+            && dashboard_before == dashboard_after && available_before == available);
         out << ",\"input_receipt\":\"unknown\",\"controller_forwarding\":\"unknown\"}";
         emit(out.str()); // One complete unbuffered record, before shutdown or another SDK read.
         ++count;
@@ -336,13 +406,14 @@ int main(int argc, char **argv) {
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGALRM, &action, nullptr) != 0) throw std::runtime_error("timeout_handler_unavailable");
         alarm(20);
-        if (argc < 2 || argc > 6) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings] [--trigger] [--dual-stick] [--right-b]");
+        if (argc < 2 || argc > 7) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings] [--trigger] [--dual-stick] [--right-b] [--head-pose]");
         for (int i = 2; i < argc; ++i) {
             const std::string option(argv[i]);
             if (option == "--bindings" && !binding_diagnostics) binding_diagnostics = true;
             else if (option == "--trigger" && !trigger_diagnostic) trigger_diagnostic = true;
             else if (option == "--dual-stick" && !dual_stick_diagnostic) dual_stick_diagnostic = true;
             else if (option == "--right-b" && !right_b_diagnostic) right_b_diagnostic = true;
+            else if (option == "--head-pose" && !head_pose_diagnostic) head_pose_diagnostic = true;
             else throw std::runtime_error("invalid_or_duplicate_observer_option");
         }
         const auto manifest = std::filesystem::path(argv[1]);
@@ -352,6 +423,7 @@ int main(int argc, char **argv) {
              + boolean(binding_diagnostics) + (trigger_diagnostic ? ",\"trigger_diagnostic\":true" : "")
              + (dual_stick_diagnostic ? ",\"dual_stick_diagnostic\":true" : "")
              + (right_b_diagnostic ? ",\"right_b_diagnostic\":true" : "")
+             + (head_pose_diagnostic ? ",\"head_pose_diagnostic\":true" : "")
              + ",\"input_receipt\":\"unknown\"}");
         stage = "setup";
         unsigned count;

@@ -85,3 +85,30 @@ The B record contains the native error, active state, boolean value, change flag
 When combined with `--bindings`, the existing three bounded snapshots include B. All four optional flags can coexist, yielding at most five actions per snapshot. Capacities, no-retry behavior, the 15-second/300-sample window and the whole-process deadline remain unchanged. Duplicate/unknown options fail before SDK initialization. A failed, zero or aliased B action handle fails setup before sampling.
 
 A producer pulse is a separate opt-in test operation. It requires fresh hidden-dashboard VRLink context, unique correctly handed synthetic devices, active exact origins for B/A/both sticks, neutral A and both sticks, and a guarded current lease. The observer itself never produces input. Determine the actual legacy bit in each receiver context from bounded before/held/after raw observations before assigning a gamepad button. A model name or a local binding prediction alone cannot establish the streamed or in-game mapping.
+
+## Optional raw HMD observation
+
+`--head-pose` adds raw public SDK HMD observations in the same Background client and manifest lifetime. It reuses the observer's existing `GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding, 0, ...)` array query. It adds two `GetTrackedDeviceClass` calls bracketing that query at the public SDK's fixed HMD index zero. The start record gains `head_pose_diagnostic=true`; each sample gains `head_pose`. Without this option there is no head record, head clock sampling or additional SDK query. The manifest, binding resources and input proxy remain unchanged.
+
+```sh
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --dual-stick --right-b --head-pose > PRIVATE_FRESH_CAPTURE.jsonl
+```
+
+`head_pose` contains:
+
+- `device_index=0`, `tracking_space="standing"` and `prediction_seconds=0`.
+- `class_before` and `class_after`, with null for failed class queries; `pose_query_returned` and a sanitized `query_error`.
+- `connected`, `valid`, the raw integer `tracking_result`, a row-major3-by4 `matrix`, and `matrix_finite`. Nonfinite components become null with `matrix_finite=false`. A failed pose query leaves these fields null rather than constructing an identity or neutral pose.
+- `sdk_pose_available` and `unavailable_reason`. Availability requires both class reads to return HMD, a returned pose query, connected/valid flags and a finite matrix. It does not validate a particular tracking-result value, expected pose, synthetic-device identity, stream association or game receipt.
+- `context_unchanged`, comparing the existing sample's before/after scene PID, dashboard and input-availability fields. Equal unavailable/zero contexts can still produce true. Consumers must separately require their expected nonzero scene PID/application key, hidden dashboard, available input, active exact action origins and unique correctly handed producer devices. No field waives those guards.
+- `query_started_utc_unix_ms` and `query_completed_utc_unix_ms`, plus `query_started_monotonic_ns` and `query_completed_monotonic_ns` as decimal strings. These bracket class-before, the existing pose query and class-after in the observer's clock domain. The outer observer PID/sequence links the head and controller records. The steady-clock epoch is implementation-specific; UTC can adjust. Cross-process or cross-machine association requires independently established clock relationships and bounded skew, not equal timestamps alone.
+
+`pose_api_error` remains null because the public pose API returns void, not an error code. A caught class/pose query exception is reported by category with no exception text and unavailable head status. Head records retain the raw tracking result for caller review, including disconnected/invalid states. The option is passive and never sets a transform, requests focus, changes input priority, registers a device or opens a second SDK client.
+
+All five optional flags can coexist. The existing15-second,300-sample,20Hz sampling and20-second whole-process deadline remain unchanged; head adds no binding action. Duplicate or unknown options fail before SDK initialization. Context and class reads are sequential and do not exclude transient changes or device replacement at index zero. Raw Standing SDK receipt is separate from the input proxy's local override state, headset display/physical tracking, Windows receipt and original game consumption. It is not end-to-end head-pose validation.
+
+CPU fixtures compile against the committed public SDK header and exercise the default query count, shared-client optional flags, raw matrix/error/unknown states, class/context changes, timestamps and shutdown deadline without connecting to SteamVR:
+
+```sh
+python3 -m unittest discover -s tests -p test_controller_head_pose.py -v
+```
