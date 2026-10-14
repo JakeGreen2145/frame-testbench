@@ -20,6 +20,7 @@ constexpr auto duration = std::chrono::seconds(15);
 constexpr auto interval = std::chrono::milliseconds(50);
 constexpr uint32_t device_limit = std::min<uint32_t>(64, vr::k_unMaxTrackedDeviceCount);
 const char *stage = "validation";
+bool binding_diagnostics = false;
 void timed_out(int) {
     constexpr char message[] = "{\"event\":\"error\",\"schema_version\":1,\"error\":\"whole_process_deadline\",\"outcome\":\"unknown\",\"input_receipt\":\"unknown\"}\n";
     const auto ignored = write(output_fd, message, sizeof(message) - 1);
@@ -117,15 +118,64 @@ std::string producer(vr::IVRSystem *system, const std::array<vr::TrackedDevicePo
     }
     return "{\"match_count\":" + std::to_string(matches) + ",\"device\":" + (matches == 1 ? row : "null") + '}';
 }
+template<size_t N> std::string bounded_text(const char (&value)[N]);
 std::string origin(vr::IVRInput *input, vr::IVRSystem *system, vr::VRInputValueHandle_t handle) {
     vr::InputOriginInfo_t info{};
+    std::fill(std::begin(info.rchRenderModelComponentName), std::end(info.rchRenderModelComponentName), '\x7f');
     info.trackedDeviceIndex = vr::k_unTrackedDeviceIndexInvalid;
     const auto error = input->GetOriginTrackedDeviceInfo(handle, &info, sizeof(info));
     const bool valid = error == vr::VRInputError_None && info.trackedDeviceIndex < device_limit;
     return "{\"handle\":" + quote(std::to_string(handle)) + ",\"error\":" + std::to_string(error)
         + ",\"device_index\":" + (valid ? std::to_string(info.trackedDeviceIndex) : "null")
         + ",\"device_path_handle\":" + (valid ? quote(std::to_string(info.devicePath)) : "null")
-        + ",\"serial\":" + (valid ? serial(system, info.trackedDeviceIndex).json() : "null") + '}';
+        + ",\"serial\":" + (valid ? serial(system, info.trackedDeviceIndex).json() : "null")
+        + ",\"component\":" + (error == vr::VRInputError_None ? bounded_text(info.rchRenderModelComponentName) : "null") + '}';
+}
+template<size_t N> std::string bounded_text(const char (&value)[N]) {
+    const auto end = std::find(value, value + N, '\0');
+    return end == value + N ? "{\"value\":null,\"validation_error\":\"unterminated\"}"
+        : "{\"value\":" + quote(std::string(value, end)) + ",\"validation_error\":null}";
+}
+void binding_snapshot(vr::IVRInput *input, vr::IVRSystem *system,
+                      vr::VRActionSetHandle_t set, vr::VRActionHandle_t action,
+                      const char *name, unsigned sequence) {
+    // Read-only, fixed-capacity calls in the existing SDK lifetime. No retries,
+    // binding displays, focus requests, priority changes or producer writes.
+    std::array<vr::InputBindingInfo_t, 16> bindings;
+    for (auto &row : bindings) {
+        std::fill(std::begin(row.rchDevicePathName), std::end(row.rchDevicePathName), '\x7f');
+        std::fill(std::begin(row.rchInputPathName), std::end(row.rchInputPathName), '\x7f');
+        std::fill(std::begin(row.rchModeName), std::end(row.rchModeName), '\x7f');
+        std::fill(std::begin(row.rchSlotName), std::end(row.rchSlotName), '\x7f');
+        std::fill(std::begin(row.rchInputSourceType), std::end(row.rchInputSourceType), '\x7f');
+    }
+    uint32_t returned = 0;
+    const auto binding_error = input->GetActionBindingInfo(action, bindings.data(), sizeof(bindings[0]), bindings.size(), &returned);
+    std::array<vr::VRInputValueHandle_t, 64> origins{};
+    const auto origin_error = input->GetActionOrigins(set, action, origins.data(), origins.size());
+    const auto prefix = std::string("\"schema_version\":1,\"observer_pid\":") + std::to_string(getpid())
+        + ",\"sample_sequence\":" + std::to_string(sequence) + ",\"action\":" + quote(name);
+    const bool binding_valid = binding_error == vr::VRInputError_None && returned <= bindings.size();
+    emit("{\"event\":\"binding_query\"," + prefix + ",\"binding_error\":" + std::to_string(binding_error)
+        + ",\"binding_capacity\":16,\"returned_binding_count\":" + std::to_string(returned)
+        + ",\"binding_count_valid\":" + boolean(binding_valid)
+        + ",\"binding_capacity_reached\":" + boolean(returned >= bindings.size())
+        + ",\"origins_error\":" + std::to_string(origin_error)
+        + ",\"origins_capacity\":64,\"origins_completeness\":\"unknown\",\"input_receipt\":\"unknown\"}");
+    if (binding_valid) for (uint32_t i = 0; i < returned; ++i) {
+        const auto &row = bindings[i];
+        emit("{\"event\":\"binding_entry\"," + prefix + ",\"entry_index\":" + std::to_string(i)
+            + ",\"device_path\":" + bounded_text(row.rchDevicePathName)
+            + ",\"input_path\":" + bounded_text(row.rchInputPathName)
+            + ",\"mode\":" + bounded_text(row.rchModeName)
+            + ",\"slot\":" + bounded_text(row.rchSlotName)
+            + ",\"input_source_type\":" + bounded_text(row.rchInputSourceType) + '}');
+    }
+    if (origin_error == vr::VRInputError_None) for (size_t i = 0; i < origins.size(); ++i) {
+        if (origins[i] == vr::k_ulInvalidInputValueHandle) continue;
+        emit("{\"event\":\"binding_origin\"," + prefix + ",\"entry_index\":" + std::to_string(i)
+            + ",\"origin\":" + origin(input, system, origins[i]) + '}');
+    }
 }
 std::string application_key(vr::IVRApplications *apps, uint32_t pid) {
     std::array<char, 256> buffer;
@@ -179,6 +229,10 @@ unsigned observe(frame_observe::Sdk &sdk) {
         const auto producer_value = producer(system, poses);
         const auto a_origin = a_active ? origin(input, system, digital.activeOrigin) : "null";
         const auto axis_origin = axis_active ? origin(input, system, analog.activeOrigin) : "null";
+        if (binding_diagnostics && count % 100 == 0) {
+            binding_snapshot(input, system, set.ulActionSet, a, "right_a", count);
+            binding_snapshot(input, system, set.ulActionSet, axis, "axis0", count);
+        }
         const bool available = system->IsInputAvailable();
         const auto scene_after = compositor->GetCurrentSceneFocusProcess();
         const bool dashboard_after = overlay->IsDashboardVisible();
@@ -219,11 +273,14 @@ int main(int argc, char **argv) {
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGALRM, &action, nullptr) != 0) throw std::runtime_error("timeout_handler_unavailable");
         alarm(20);
-        if (argc != 2) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON");
+        if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--bindings"))
+            throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings]");
+        binding_diagnostics = argc == 3;
         const auto manifest = std::filesystem::path(argv[1]);
         validate_manifest(manifest); // Both reviewed files validated before SDK initialization.
         emit("{\"event\":\"start\",\"schema_version\":1,\"observer_pid\":" + std::to_string(getpid())
-             + ",\"application_type\":\"background\",\"duration_seconds\":15,\"sample_limit\":300,\"maximum_hz\":20,\"input_receipt\":\"unknown\"}");
+             + ",\"application_type\":\"background\",\"duration_seconds\":15,\"sample_limit\":300,\"maximum_hz\":20,\"binding_diagnostics\":"
+             + boolean(binding_diagnostics) + ",\"input_receipt\":\"unknown\"}");
         stage = "setup";
         unsigned count;
         {

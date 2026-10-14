@@ -15,6 +15,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def action_fixture():
     return fake_source({
+        'GetActionBindingInfo': '''if(unBindingInfoSize!=sizeof(*pOriginInfo) || unBindingInfoCount!=16 || !punReturnedBindingInfoCount)abort();
+            if(action<1 || action>action_names.size())abort();
+            log("binding_info_16");
+            if(updates>=201){*punReturnedBindingInfoCount=20;return VRInputError_BufferTooSmall;}
+            if(updates>=101){*punReturnedBindingInfoCount=17;return VRInputError_None;}
+            *punReturnedBindingInfoCount=2;
+            for(unsigned i=0;i<2;i++){
+                strcpy(pOriginInfo[i].rchDevicePathName,"/user/hand/right");
+                strcpy(pOriginInfo[i].rchInputPathName,"/input/a/click");
+                if(i==0)strcpy(pOriginInfo[i].rchModeName,"button");
+                strcpy(pOriginInfo[i].rchSlotName,"click");
+                strcpy(pOriginInfo[i].rchInputSourceType,"button");
+            }return VRInputError_None;''',
+        'GetActionOrigins': '''if(actionSetHandle!=90 || digitalActionHandle<1 || digitalActionHandle>action_names.size() || originOutCount!=64)abort();
+            log("action_origins_64");
+            if(updates>=201)return VRInputError_InvalidHandle;
+            originsOut[0]=1107;originsOut[1]=1104;originsOut[2]=18446744073709551614ull;
+            return VRInputError_None;''',
+        'GetOriginTrackedDeviceInfo': '''if(unOriginInfoSize!=sizeof(*pOriginInfo))abort();
+            if(origin==18446744073709551614ull)return VRInputError_InvalidHandle;
+            if(origin!=1104 && origin!=1107)abort();
+            *pOriginInfo={};pOriginInfo->devicePath=origin-1000;pOriginInfo->trackedDeviceIndex=origin==1104?4:7;
+            strcpy(pOriginInfo->rchRenderModelComponentName,"input");return VRInputError_None;''',
         'GetCurrentSceneFocusProcess': 'return updates<24?777:888;',
         'IsDashboardVisible': 'return updates>=35;',
         'GetApplicationKeyByProcessId': '''if(unAppKeyBufferLen!=256) abort();
@@ -117,6 +140,36 @@ class ControllerActionTests(unittest.TestCase):
         self.assertEqual(calls.count('manifest'), 1)
         self.assertEqual(calls.count('shutdown'), 1)
         self.assertEqual(calls.count('update_actions'), len(samples))
+        self.assertFalse(any(line.startswith('set_') for line in calls))
+        self.assertNotIn('binding_info_16', calls)
+        self.assertNotIn('action_origins_64', calls)
+
+    def test_opt_in_binding_reads_are_bounded_in_same_client_and_errors_unknown(self):
+        records = self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--bindings'])
+        self.assertTrue(records[0]['binding_diagnostics'])
+        queries = [r for r in records if r['event'] == 'binding_query']
+        self.assertEqual(len(queries), 6)
+        self.assertEqual({r['sample_sequence'] for r in queries}, {0, 100, 200})
+        self.assertEqual({r['action'] for r in queries}, {'right_a', 'axis0'})
+        self.assertTrue(all(r['binding_capacity'] == 16 and r['origins_capacity'] == 64 for r in queries))
+        self.assertTrue(all(r['origins_completeness'] == 'unknown' for r in queries))
+        self.assertTrue(all(r['returned_binding_count'] == 17 and not r['binding_count_valid'] for r in queries if r['sample_sequence'] == 100))
+        self.assertTrue(all(r['binding_error'] != 0 and r['origins_error'] != 0 for r in queries if r['sample_sequence'] == 200))
+        entries = [r for r in records if r['event'] == 'binding_entry']
+        self.assertEqual(len(entries), 4)
+        self.assertTrue(all(r['sample_sequence'] == 0 for r in entries))
+        self.assertTrue(any(r['mode']['value'] is None and r['mode']['validation_error'] == 'unterminated' for r in entries))
+        origins = [r for r in records if r['event'] == 'binding_origin']
+        self.assertEqual(len(origins), 12)
+        self.assertTrue(any(r['origin']['handle'] == '18446744073709551614' and r['origin']['error'] != 0 and r['origin']['device_index'] is None for r in origins))
+        self.assertTrue(any(r['origin']['serial'] and r['origin']['serial']['value'] == 'frame_testbench_right' and r['origin']['component']['value'] == 'input' for r in origins))
+        self.assertTrue(all(len(json.dumps(r).encode()) < 16384 for r in records))
+        calls = self.calls()
+        self.assertEqual(calls.count('binding_info_16'), 6)
+        self.assertEqual(calls.count('action_origins_64'), 6)
+        self.assertEqual(calls.count('init_background'), 1)
+        self.assertEqual(calls.count('manifest'), 1)
+        self.assertEqual(calls.count('shutdown'), 1)
         self.assertFalse(any(line.startswith('set_') for line in calls))
 
     def test_shutdown_deadline_keeps_flushed_samples_and_reports_unknown(self):
