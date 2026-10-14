@@ -122,6 +122,8 @@ class Session:
 
 def dispatch(args, bench, operation):
     """Arm recovery before mutations; observations renew only an existing session."""
+    if args.command == 'controller-trace':
+        return operation(args, bench)
     session = Session(bench)
     if args.command == 'session':
         with session.locked():

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <atomic>
 #include <string>
 using namespace vr;
 namespace {
@@ -111,13 +112,22 @@ void controller_metrics() {
 }
 double other_x = 0;
 bool worn = false, other_worn = true;
+std::atomic<unsigned> property_reads{0}, property_writes{0}, extra_registrations{0};
 unsigned pose_count = 0, worn_count = 0, host_mask = 0, input_mask = 0;
 void *other_interface;
 class Host : public IVRServerDriverHost {
 public:
     bool TrackedDeviceAdded(const char *s, ETrackedDeviceClass c, ITrackedDeviceServerDriver *d) override {
         if (c == TrackedDeviceClass_HMD) { assert(!strcmp(s, "cv-real-hmd")); hmd = d; assert(d->Activate(7) == VRInitError_None); }
-        else if (!strcmp(s, "cv-controller")) { assert(c == TrackedDeviceClass_Controller); controller = d; }
+        else if (!strcmp(s, "cv-controller")) {
+            assert(c == TrackedDeviceClass_Controller); controller = d;
+            if(std::getenv("FRAME_TESTBENCH_TRACE_CONTROLLERS")) {
+                assert(controller->GetPose().vecPosition[0]==18);
+                const auto error=controller->Activate(9);
+                assert(error==(std::getenv("FAKE_TRACE_ACTIVATE_ERROR") ? VRInitError_Driver_Failed : VRInitError_None));
+            }
+        }
+        else if(!strncmp(s,"cv-extra-",9)) { assert(c==TrackedDeviceClass_Controller); ++extra_registrations; }
         else {
             assert(c == TrackedDeviceClass_Controller);
             int k = !strcmp(s, "frame_testbench_left") ? 0 : 1;
@@ -163,6 +173,7 @@ class Input : public IVRDriverInput {
     int prox_count = 0;
 public:
     EVRInputError CreateBooleanComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h) override {
+        if(c>=109 && !strncmp(n,"/trace/component/",17)) return create_input(c,n,h,true,VRScalarType_Absolute,VRScalarUnits_NormalizedOneSided);
         if (c == 120 || c == 121) return create_input(c, n, h, true, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
         if (c == 107 && !strcmp(n,"/proximity")) *h = ++prox_count + 500;
         else if (c == 109 && !strcmp(n,"/proximity")) *h = 503;
@@ -188,8 +199,27 @@ public:
 } input;
 class Properties : public IVRProperties {
 public:
-    ETrackedPropertyError ReadPropertyBatch(PropertyContainerHandle_t, PropertyRead_t *, uint32_t) override { return TrackedProp_Success; }
+    ETrackedPropertyError ReadPropertyBatch(PropertyContainerHandle_t c, PropertyRead_t *reads, uint32_t count) override {
+        ++property_reads;
+        for(uint32_t k=0;k<count;++k) {
+            auto& r=reads[k]; r.unTag=0; r.unRequiredBufferSize=0; r.eError=TrackedProp_UnknownProperty;
+            if(c!=109) continue;
+            if(r.prop==Prop_ControllerRoleHint_Int32) {
+                r.unTag=k_unInt32PropertyTag; r.unRequiredBufferSize=sizeof(int32_t);
+                if(r.unBufferSize<sizeof(int32_t)) { r.eError=TrackedProp_BufferTooSmall; continue; }
+                const int32_t role=roles.count(109) ? roles[109] : 2;
+                memcpy(r.pvBuffer,&role,sizeof(role)); r.eError=TrackedProp_Success;
+            } else if(r.prop==Prop_InputProfilePath_String || r.prop==Prop_ControllerType_String) {
+                const char* value=r.prop==Prop_InputProfilePath_String ? "{native_frame}/input/native_controller.json" : "native_frame_controller";
+                r.unTag=k_unStringPropertyTag; r.unRequiredBufferSize=std::strlen(value)+1;
+                if(r.unBufferSize<r.unRequiredBufferSize) { r.eError=TrackedProp_BufferTooSmall; continue; }
+                memcpy(r.pvBuffer,value,r.unRequiredBufferSize); r.eError=TrackedProp_Success;
+            }
+        }
+        return TrackedProp_Success;
+    }
     ETrackedPropertyError WritePropertyBatch(PropertyContainerHandle_t c, PropertyWrite_t *writes, uint32_t count) override {
+        ++property_writes;
         assert(c == 120 || c == 121);
         for (uint32_t i = 0; i < count; ++i) {
             auto &w = writes[i];
@@ -212,6 +242,7 @@ public:
         if (e) *e = VRInitError_None;
         if (!strcmp(n,IVRServerDriverHost_Version)) return &host;
         if (!strcmp(n,IVRDriverInput_Version)) return &input;
+        if (!strcmp(n,"input-alias")) return &input;
         if (!strcmp(n,IVRProperties_Version)) return &properties;
         if (e) *e = VRInitError_Init_InterfaceNotFound;
         return other_interface;
@@ -254,6 +285,7 @@ int main(int argc, char **) {
     auto get_component = reinterpret_cast<void *(*)()>(dlsym(real,"FrameFakeComponent"));
     auto get_other = reinterpret_cast<void *(*)()>(dlsym(real,"FrameFakeOther"));
     other_interface = get_other();
+    auto bypass_input=reinterpret_cast<void (*)(IVRDriverInput*)>(dlsym(real,"FrameFakeBypassInput")); assert(bypass_input); bypass_input(&input);
     if (provider->Init(&context) != VRInitError_None) return 3;
     physical();
     bool cleaned = false;
@@ -262,6 +294,20 @@ int main(int argc, char **) {
     while (std::getline(std::cin, cmd)) {
         if (cmd == "quit") break;
         if (cmd == "physical") { physical(); metrics(); }
+        else if(cmd=="physical-controller-methods") {
+            controller->EnterStandby(); char out[20]{}; controller->DebugRequest("debug-test",out,sizeof(out));
+            assert(!strcmp(out,"debug-ok") && controller->GetComponent("display-test")==get_component() && controller->GetPose().vecPosition[0]==18);
+            std::cout << "{\"ok\":true}" << std::endl;
+        }
+        else if(cmd=="physical-controller-deactivate") { controller->Deactivate(); std::cout << "{\"ok\":true}" << std::endl; }
+        else if(cmd=="physical-controller-activate") { assert(controller->Activate(9)==VRInitError_None); std::cout << "{\"ok\":true}" << std::endl; }
+        else if(cmd=="trace-role-zero") { roles[109]=0; std::cout << "{\"ok\":true}" << std::endl; }
+        else if(cmd=="trace-role-right") { roles[109]=2; std::cout << "{\"ok\":true}" << std::endl; }
+        else if(cmd=="property-counts") { std::cout << "{\"reads\":" << property_reads << ",\"writes\":" << property_writes << "}" << std::endl; }
+        else if(cmd=="trace-flood") {
+            auto flood=reinterpret_cast<void (*)()>(dlsym(real,"FrameFakeFloodTrace")); assert(flood); flood();
+            std::cout << "{\"ok\":true,\"registrations\":" << extra_registrations << "}" << std::endl;
+        }
         else if (cmd == "deactivate") { hmd->Deactivate(); std::cout << "{\"deactivated\":" << ((lifecycle() & 2) != 0) << "}" << std::endl; }
         else if (cmd == "metrics") metrics();
         else if (cmd == "controllers") controller_metrics();
