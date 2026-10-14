@@ -70,3 +70,18 @@ python3 -m unittest discover -s tests -p test_controller_actions.py -v
 ```
 
 These checks load no SteamVR. A successful observation window is not input delivery. Runtime observations of same-origin neutral/pressed/released transitions, Windows controller receipt and original game response remain separate results.
+
+
+## Optional right B observation
+
+`--right-b` resolves the existing `/actions/observe/in/right_b_click` action and reads digital data through the existing right-hand source in the same SDK lifetime. It adds `right_b_diagnostic=true` to the start record and a `right_b` field to each sample. Neither resource nor its byte pin changes. Without this option, the observer does not resolve, read or emit B.
+
+```sh
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --dual-stick --right-b > PRIVATE_FRESH_CAPTURE.jsonl
+```
+
+The B record contains the native error, active state, boolean value, change flag, update time and exact origin. Failed reads keep active/value/origin null. Inactive reads keep value/origin null. A successful false boolean is a neutral state; a missing state is unknown. The origin includes bounded serial/property errors, decimal-string uint64 handles, actual device index, class and role, with explicit validation errors for an invalid origin handle or out-of-range index. These observations do not prove receipt in a Windows game.
+
+When combined with `--bindings`, the existing three bounded snapshots include B. All four optional flags can coexist, yielding at most five actions per snapshot. Capacities, no-retry behavior, the 15-second/300-sample window and the whole-process deadline remain unchanged. Duplicate/unknown options fail before SDK initialization. A failed, zero or aliased B action handle fails setup before sampling.
+
+A producer pulse is a separate opt-in test operation. It requires fresh hidden-dashboard VRLink context, unique correctly handed synthetic devices, active exact origins for B/A/both sticks, neutral A and both sticks, and a guarded current lease. The observer itself never produces input. Determine the actual legacy bit in each receiver context from bounded before/held/after raw observations before assigning a gamepad button. A model name or a local binding prediction alone cannot establish the streamed or in-game mapping.

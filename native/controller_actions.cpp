@@ -23,6 +23,7 @@ const char *stage = "validation";
 bool binding_diagnostics = false;
 bool trigger_diagnostic = false;
 bool dual_stick_diagnostic = false;
+bool right_b_diagnostic = false;
 void timed_out(int) {
     constexpr char message[] = "{\"event\":\"error\",\"schema_version\":1,\"error\":\"whole_process_deadline\",\"outcome\":\"unknown\",\"input_receipt\":\"unknown\"}\n";
     const auto ignored = write(output_fd, message, sizeof(message) - 1);
@@ -189,7 +190,7 @@ void binding_snapshot(vr::IVRInput *input, vr::IVRSystem *system,
     if (origin_error == vr::VRInputError_None) for (size_t i = 0; i < origins.size(); ++i) {
         if (origins[i] == vr::k_ulInvalidInputValueHandle) continue;
         emit("{\"event\":\"binding_origin\"," + prefix + ",\"entry_index\":" + std::to_string(i)
-            + ",\"origin\":" + origin(input, system, origins[i], dual_stick_diagnostic) + '}');
+            + ",\"origin\":" + origin(input, system, origins[i], dual_stick_diagnostic || right_b_diagnostic) + '}');
     }
 }
 std::string application_key(vr::IVRApplications *apps, uint32_t pid) {
@@ -213,11 +214,12 @@ unsigned observe(frame_observe::Sdk &sdk) {
     auto *apps = sdk.get<vr::IVRApplications>(vr::IVRApplications_Version);
     vr::VRActiveActionSet_t set{}; // Default priority, all-device set; never raises priority.
     check(input->GetActionSetHandle("/actions/observe", &set.ulActionSet));
-    vr::VRActionHandle_t a = 0, axis = 0, trigger = 0, left_axis = 0;
+    vr::VRActionHandle_t a = 0, axis = 0, trigger = 0, left_axis = 0, b = 0;
     vr::VRInputValueHandle_t right = 0, left = 0;
     check(input->GetActionHandle("/actions/observe/in/right_a_click", &a));
     check(input->GetActionHandle("/actions/observe/in/right_thumbstick_position", &axis));
     if (trigger_diagnostic) check(input->GetActionHandle("/actions/observe/in/right_trigger_value", &trigger));
+    if (right_b_diagnostic) check(input->GetActionHandle("/actions/observe/in/right_b_click", &b));
     check(input->GetInputSourceHandle("/user/hand/right", &right));
     if (dual_stick_diagnostic) {
         check(input->GetActionHandle("/actions/observe/in/left_thumbstick_position", &left_axis));
@@ -228,6 +230,8 @@ unsigned observe(frame_observe::Sdk &sdk) {
     if (dual_stick_diagnostic && (!left_axis || left_axis == axis || left_axis == a || (trigger_diagnostic && left_axis == trigger)))
         throw std::runtime_error("invalid_left_action_handle");
     if (dual_stick_diagnostic && (!left || left == right)) throw std::runtime_error("invalid_left_source_handle");
+    if (right_b_diagnostic && (!b || b == a || b == axis || (trigger_diagnostic && b == trigger)
+        || (dual_stick_diagnostic && b == left_axis))) throw std::runtime_error("invalid_right_b_action_handle");
     stage = "sampling";
     const auto start = std::chrono::steady_clock::now();
     const auto end = start + duration;
@@ -239,17 +243,19 @@ unsigned observe(frame_observe::Sdk &sdk) {
         const bool available_before = system->IsInputAvailable();
         const auto key = application_key(apps, scene_before);
         const auto update = input->UpdateActionState(&set, sizeof(set), 1);
-        vr::InputDigitalActionData_t digital{};
+        vr::InputDigitalActionData_t digital{}, b_data{};
         vr::InputAnalogActionData_t analog{};
         vr::InputAnalogActionData_t trigger_data{}, left_data{};
-        auto a_error = update, axis_error = update, trigger_error = update, left_error = update;
+        auto a_error = update, axis_error = update, trigger_error = update, left_error = update, b_error = update;
         if (update == vr::VRInputError_None) {
             a_error = input->GetDigitalActionData(a, &digital, sizeof(digital), right);
+            if (right_b_diagnostic) b_error = input->GetDigitalActionData(b, &b_data, sizeof(b_data), right);
             axis_error = input->GetAnalogActionData(axis, &analog, sizeof(analog), right);
             if (trigger_diagnostic) trigger_error = input->GetAnalogActionData(trigger, &trigger_data, sizeof(trigger_data), right);
             if (dual_stick_diagnostic) left_error = input->GetAnalogActionData(left_axis, &left_data, sizeof(left_data), left);
         }
         const bool a_active = a_error == vr::VRInputError_None && digital.bActive;
+        const bool b_active = right_b_diagnostic && b_error == vr::VRInputError_None && b_data.bActive;
         const bool axis_active = axis_error == vr::VRInputError_None && analog.bActive;
         const bool trigger_active = trigger_diagnostic && trigger_error == vr::VRInputError_None && trigger_data.bActive;
         const bool left_active = dual_stick_diagnostic && left_error == vr::VRInputError_None && left_data.bActive;
@@ -257,6 +263,7 @@ unsigned observe(frame_observe::Sdk &sdk) {
         system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses.data(), poses.size());
         const auto producer_value = producer(system, poses);
         const auto left_producer = dual_stick_diagnostic ? producer(system, poses, "frame_testbench_left") : "null";
+        const auto b_origin = b_active ? origin(input, system, b_data.activeOrigin, true) : "null";
         const auto a_origin = a_active ? origin(input, system, digital.activeOrigin, dual_stick_diagnostic) : "null";
         const auto axis_origin = axis_active ? origin(input, system, analog.activeOrigin, dual_stick_diagnostic) : "null";
         const auto trigger_origin = trigger_active ? origin(input, system, trigger_data.activeOrigin, dual_stick_diagnostic) : "null";
@@ -264,6 +271,7 @@ unsigned observe(frame_observe::Sdk &sdk) {
         if (binding_diagnostics && count % 100 == 0) {
             binding_snapshot(input, system, set.ulActionSet, a, "right_a", count);
             binding_snapshot(input, system, set.ulActionSet, axis, "axis0", count);
+            if (right_b_diagnostic) binding_snapshot(input, system, set.ulActionSet, b, "right_b", count);
             if (trigger_diagnostic) binding_snapshot(input, system, set.ulActionSet, trigger, "right_trigger", count);
             if (dual_stick_diagnostic) binding_snapshot(input, system, set.ulActionSet, left_axis, "left_axis0", count);
         }
@@ -288,6 +296,14 @@ unsigned observe(frame_observe::Sdk &sdk) {
             << ",\"active\":" << (axis_error == vr::VRInputError_None ? boolean(analog.bActive) : "null") << ",\"value\":";
         if (axis_active) { out << '['; number(out, analog.x); out << ','; number(out, analog.y); out << ']'; } else out << "null";
         out << ",\"origin\":" << axis_origin << '}';
+        if (right_b_diagnostic) {
+            out << ",\"right_b\":{\"error\":" << b_error << ",\"active\":"
+                << (b_error == vr::VRInputError_None ? boolean(b_data.bActive) : "null") << ",\"value\":"
+                << (b_active ? boolean(b_data.bState) : "null") << ",\"changed\":"
+                << (b_active ? boolean(b_data.bChanged) : "null") << ",\"update_time\":";
+            if (b_active) number(out, b_data.fUpdateTime); else out << "null";
+            out << ",\"origin\":" << b_origin << '}';
+        }
         if (trigger_diagnostic) {
             out << ",\"right_trigger\":{\"error\":" << trigger_error << ",\"active\":"
                 << (trigger_error == vr::VRInputError_None ? boolean(trigger_data.bActive) : "null") << ",\"value\":";
@@ -320,12 +336,13 @@ int main(int argc, char **argv) {
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGALRM, &action, nullptr) != 0) throw std::runtime_error("timeout_handler_unavailable");
         alarm(20);
-        if (argc < 2 || argc > 5) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings] [--trigger] [--dual-stick]");
+        if (argc < 2 || argc > 6) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings] [--trigger] [--dual-stick] [--right-b]");
         for (int i = 2; i < argc; ++i) {
             const std::string option(argv[i]);
             if (option == "--bindings" && !binding_diagnostics) binding_diagnostics = true;
             else if (option == "--trigger" && !trigger_diagnostic) trigger_diagnostic = true;
             else if (option == "--dual-stick" && !dual_stick_diagnostic) dual_stick_diagnostic = true;
+            else if (option == "--right-b" && !right_b_diagnostic) right_b_diagnostic = true;
             else throw std::runtime_error("invalid_or_duplicate_observer_option");
         }
         const auto manifest = std::filesystem::path(argv[1]);
@@ -334,6 +351,7 @@ int main(int argc, char **argv) {
              + ",\"application_type\":\"background\",\"duration_seconds\":15,\"sample_limit\":300,\"maximum_hz\":20,\"binding_diagnostics\":"
              + boolean(binding_diagnostics) + (trigger_diagnostic ? ",\"trigger_diagnostic\":true" : "")
              + (dual_stick_diagnostic ? ",\"dual_stick_diagnostic\":true" : "")
+             + (right_b_diagnostic ? ",\"right_b_diagnostic\":true" : "")
              + ",\"input_receipt\":\"unknown\"}");
         stage = "setup";
         unsigned count;
