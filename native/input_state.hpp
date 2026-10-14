@@ -1,6 +1,7 @@
 #pragma once
 #include "openvr_driver.h"
 #include "controller_inputs.hpp"
+#include "controller_trace.hpp"
 #include <atomic>
 #include <array>
 #include <map>
@@ -15,6 +16,8 @@ namespace frame {
 // Recursive for synchronous runtime callbacks such as GetPose during publication.
 // Registration and property writes must happen outside this lock.
 class InputState {
+    ControllerTrace trace_;
+    vr::IVRProperties *trace_properties_ = nullptr;
     std::recursive_mutex mutex_;
     vr::IVRServerDriverHost *host_ = nullptr;
     vr::IVRDriverInput *input_ = nullptr;
@@ -40,6 +43,8 @@ class InputState {
     bool controller_release_locked(unsigned hand, bool force = false);
     std::string status_locked(bool ok, const char *error);
 public:
+    ControllerTrace &trace() { return trace_; }
+    void trace_properties(vr::IVRProperties *properties) { trace_properties_ = properties; }
     void reset(vr::IVRServerDriverHost *, vr::IVRDriverInput *);
     void activate(uint32_t, vr::PropertyContainerHandle_t);
     void deactivate(uint32_t);

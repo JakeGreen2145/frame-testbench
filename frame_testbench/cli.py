@@ -76,6 +76,7 @@ def parser():
     commands = ap.add_subparsers(dest='command', required=True)
     commands.add_parser('status', help='runtime poses, frames and input override readback')
     commands.add_parser('inputs', help='independent SteamVR controller action readback')
+    commands.add_parser('controller-trace', help='read opt-in native physical-controller callback trace; does not renew test leases')
     compositor = commands.add_parser('compositor', help='temporarily control compositor standby policy')
     compositor.add_argument('mode', choices=('awake', 'auto'))
     worn = commands.add_parser('worn', help='override HMD proximity independently of pose')
@@ -141,6 +142,8 @@ def parser():
 
 
 def dispatch(args, bench):
+    if args.command == 'controller-trace':
+        return bench.control('controller-trace')
     input_command = controller_inputs.command(args)
     if input_command is not None:
         return bench.control(input_command)

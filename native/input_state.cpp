@@ -36,6 +36,7 @@ void InputState::reset(IVRServerDriverHost *h, IVRDriverInput *i) {
     host_ = h; input_ = i; index_ = k_unTrackedDeviceIndexInvalid; container_ = 0;
     physical_.reset(); requested_.reset(); worn_.reset(); proximity_.clear(); sequence_ = 0;
     controllers_ = {};
+    trace_.reset();
 }
 void InputState::activate(uint32_t i, PropertyContainerHandle_t c) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -208,11 +209,22 @@ std::string InputState::status_locked(bool ok, const char *error) {
     return o.str();
 }
 std::string InputState::command(const std::string &line) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::istringstream in(line); in.imbue(std::locale::classic());
     std::string operation, extra;
-    bool publication_ok = true;
     in >> operation;
+    if (operation == "controller-trace") {
+        if (in >> extra) {
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            return status_locked(false, "controller-trace takes no arguments");
+        }
+        // Control.stop joins this command worker before provider teardown, so
+        // its property interface remains alive. Do not block physical forwarding
+        // on the override-state lock while making diagnostic property queries.
+        trace_.refresh(trace_properties_);
+        return trace_.status();
+    }
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    bool publication_ok = true;
     if (operation == "status") {
         if (in >> extra) return status_locked(false, "status takes no arguments");
         return status_locked(true, nullptr);
