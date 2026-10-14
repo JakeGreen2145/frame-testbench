@@ -104,7 +104,8 @@ def fake_source():
             if(unDeviceIndex==2 || unDeviceIndex==4 || unDeviceIndex==7 || unDeviceIndex==63)
                 return TrackedDeviceClass_Controller;
             return unDeviceIndex==8?TrackedDeviceClass_GenericTracker:TrackedDeviceClass_Invalid;''',
-        'GetControllerRoleForTrackedDeviceIndex': '''switch(unDeviceIndex){
+        'GetControllerRoleForTrackedDeviceIndex': '''if(mode("role_invalid")) return TrackedControllerRole_Invalid;
+            switch(unDeviceIndex){
             case 2: case 4: return TrackedControllerRole_LeftHand;
             case 7: return TrackedControllerRole_RightHand;
             case 63: return TrackedControllerRole_OptOut;
@@ -112,13 +113,33 @@ def fake_source():
         'GetSeatedZeroPoseToStandingAbsoluteTrackingPose': 'return matrix(10);',
         'GetRawZeroPoseToStandingAbsoluteTrackingPose': 'return matrix(20);',
         'GetTrackedDeviceActivityLevel': 'return k_EDeviceActivityLevel_UserInteraction;',
+        'GetInt32TrackedDeviceProperty': '''if(unDeviceIndex!=2 && unDeviceIndex!=4 && unDeviceIndex!=7 && unDeviceIndex!=63) abort();
+            if(prop!=Prop_ControllerRoleHint_Int32 && prop!=Prop_ControllerHandSelectionPriority_Int32) abort();
+            log(("int_property " + std::to_string(unDeviceIndex) + " " + std::to_string(prop)).c_str());
+            if(pError) *pError=mode("metadata_error")?TrackedProp_UnknownProperty:TrackedProp_Success;
+            return prop==Prop_ControllerHandSelectionPriority_Int32?-5:
+                unDeviceIndex==7?TrackedControllerRole_RightHand:TrackedControllerRole_LeftHand;''',
         'GetStringTrackedDeviceProperty': '''if(pError) *pError=TrackedProp_Success;
+            if(getenv("FAKE_CONTROLLER_PROPERTIES")) {
+                if(unBufferSize!=256) abort();
+                log(("string_property " + std::to_string(unDeviceIndex) + " " + std::to_string(prop)).c_str());
+            }
             const char *s=prop==Prop_ModelNumber_String?"Fake \\\"HMD\\\"":prop==Prop_SerialNumber_String?"TEST-001":"fake_driver";
             if(unDeviceIndex!=0){
                 if(unDeviceIndex!=2 && unDeviceIndex!=4 && unDeviceIndex!=7 && unDeviceIndex!=63) abort();
                 s=prop==Prop_ModelNumber_String?"Pose controller":prop==Prop_SerialNumber_String?
                     (unDeviceIndex==4?"frame_testbench_left":unDeviceIndex==7?"frame_testbench_right":
                      unDeviceIndex==2?"PHYSICAL-002":"frame_testbench_left_extra"):"frame_testbench";
+            }
+            if(prop==Prop_ControllerType_String) s="frame_controller";
+            if(prop==Prop_InputProfilePath_String) s="{frame_controller}/input/frame_controller_profile.json";
+            if(prop==Prop_RegisteredDeviceType_String) {
+                s="testbench/right";
+                if(mode("property_hang")) for(;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+                if(mode("metadata_error")){if(pError)*pError=TrackedProp_UnknownProperty;return 0;}
+                if(mode("oversized_metadata")) return 257;
+                if(mode("unterminated_metadata")){memset(pchValue,'x',256);return 256;}
+                if(mode("empty_count_metadata")) return 0;
             }
             if(mode("property_error") || (mode("controller_property_error") && unDeviceIndex==7)){
                 if(pError) *pError=TrackedProp_UnknownProperty; return 0;
