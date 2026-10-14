@@ -223,6 +223,27 @@ class FakeCDP:
 
 
 class OperationTests(unittest.TestCase):
+    def test_observe_keeps_dashboard_unobserved_with_valid_owned_stream(self):
+        cdp = FakeCDP([reply(stream_associated=True), {'receipt_claimed': True}])
+        data = remote.operate(cdp, 'observe', 'pc', CLIENT, 1, ownership_nonce='a' * 32)
+        self.assertTrue(data['receipt_claimed'])
+        self.assertTrue(data['stream_associated'])
+        self.assertIsNone(data['dashboard_visible'])
+        self.assertEqual(len(cdp.expressions), 2)
+        self.assertFalse(any('IsDashboardVisible' in expr for expr, _ in cdp.expressions))
+
+    def test_already_hidden_dashboard_is_observed_without_hide_request(self):
+        cdp = FakeCDP([reply(stream_associated=True, dashboard_call_available=True),
+                       {'receipt_claimed': True}, False])
+        data = remote.operate(cdp, 'hide-dashboard', 'pc', CLIENT, 1, ownership_nonce='a' * 32)
+        self.assertTrue(data['receipt_claimed'])
+        self.assertIs(data['dashboard_visible'], False)
+        self.assertFalse(data['request_issued'])
+        self.assertFalse(data['timed_out'])
+        self.assertEqual(len(cdp.expressions), 3)
+        self.assertFalse(any('return SteamClient.OpenVR.VROverlay.HideDashboard();' in expr for expr, _ in cdp.expressions))
+        self.assertTrue(cdp.expressions[-1][1])
+
     def test_single_request_polls_association_and_timeout_keeps_unknown(self):
         empty = reply()
         cdp = FakeCDP([empty, {'receipt_claimed': False}, {'request_issued': True}, empty,

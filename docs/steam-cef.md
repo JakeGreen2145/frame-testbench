@@ -30,6 +30,8 @@ Read-only observation:
 frame-testbench-steam --host frame --expected-peer my-paired-pc observe
 ```
 
+`observe` reports stream association and receipt state; it does not query dashboard visibility. Its `dashboard_visible` value stays unknown even for a valid owned stream. Dashboard visibility is a separate observation, and a previously hidden result can become stale. The typed `SteamCEF.hide_dashboard()` phase awaits `IsDashboardVisible`; if already hidden, it returns `dashboard_visible=false` with `request_issued=false` and makes no hide call. If visible, that explicitly selected phase issues at most one guarded hide request and polls until hidden or its deadline. Do not treat the unobserved field in `observe` as a stream ownership failure.
+
 Explicit experimental connection and dashboard dismissal:
 
 ```text
