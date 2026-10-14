@@ -21,6 +21,7 @@ constexpr auto interval = std::chrono::milliseconds(50);
 constexpr uint32_t device_limit = std::min<uint32_t>(64, vr::k_unMaxTrackedDeviceCount);
 const char *stage = "validation";
 bool binding_diagnostics = false;
+bool trigger_diagnostic = false;
 void timed_out(int) {
     constexpr char message[] = "{\"event\":\"error\",\"schema_version\":1,\"error\":\"whole_process_deadline\",\"outcome\":\"unknown\",\"input_receipt\":\"unknown\"}\n";
     const auto ignored = write(output_fd, message, sizeof(message) - 1);
@@ -198,12 +199,14 @@ unsigned observe(frame_observe::Sdk &sdk) {
     auto *apps = sdk.get<vr::IVRApplications>(vr::IVRApplications_Version);
     vr::VRActiveActionSet_t set{}; // Default priority, all-device set; never raises priority.
     check(input->GetActionSetHandle("/actions/observe", &set.ulActionSet));
-    vr::VRActionHandle_t a = 0, axis = 0;
+    vr::VRActionHandle_t a = 0, axis = 0, trigger = 0;
     vr::VRInputValueHandle_t right = 0;
     check(input->GetActionHandle("/actions/observe/in/right_a_click", &a));
     check(input->GetActionHandle("/actions/observe/in/right_thumbstick_position", &axis));
+    if (trigger_diagnostic) check(input->GetActionHandle("/actions/observe/in/right_trigger_value", &trigger));
     check(input->GetInputSourceHandle("/user/hand/right", &right));
     if (!set.ulActionSet || !a || !axis || !right) throw std::runtime_error("invalid_action_handle");
+    if (trigger_diagnostic && !trigger) throw std::runtime_error("invalid_trigger_action_handle");
     stage = "sampling";
     const auto start = std::chrono::steady_clock::now();
     const auto end = start + duration;
@@ -217,21 +220,26 @@ unsigned observe(frame_observe::Sdk &sdk) {
         const auto update = input->UpdateActionState(&set, sizeof(set), 1);
         vr::InputDigitalActionData_t digital{};
         vr::InputAnalogActionData_t analog{};
-        auto a_error = update, axis_error = update;
+        vr::InputAnalogActionData_t trigger_data{};
+        auto a_error = update, axis_error = update, trigger_error = update;
         if (update == vr::VRInputError_None) {
             a_error = input->GetDigitalActionData(a, &digital, sizeof(digital), right);
             axis_error = input->GetAnalogActionData(axis, &analog, sizeof(analog), right);
+            if (trigger_diagnostic) trigger_error = input->GetAnalogActionData(trigger, &trigger_data, sizeof(trigger_data), right);
         }
         const bool a_active = a_error == vr::VRInputError_None && digital.bActive;
         const bool axis_active = axis_error == vr::VRInputError_None && analog.bActive;
+        const bool trigger_active = trigger_diagnostic && trigger_error == vr::VRInputError_None && trigger_data.bActive;
         std::array<vr::TrackedDevicePose_t, device_limit> poses{};
         system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses.data(), poses.size());
         const auto producer_value = producer(system, poses);
         const auto a_origin = a_active ? origin(input, system, digital.activeOrigin) : "null";
         const auto axis_origin = axis_active ? origin(input, system, analog.activeOrigin) : "null";
+        const auto trigger_origin = trigger_active ? origin(input, system, trigger_data.activeOrigin) : "null";
         if (binding_diagnostics && count % 100 == 0) {
             binding_snapshot(input, system, set.ulActionSet, a, "right_a", count);
             binding_snapshot(input, system, set.ulActionSet, axis, "axis0", count);
+            if (trigger_diagnostic) binding_snapshot(input, system, set.ulActionSet, trigger, "right_trigger", count);
         }
         const bool available = system->IsInputAvailable();
         const auto scene_after = compositor->GetCurrentSceneFocusProcess();
@@ -253,7 +261,14 @@ unsigned observe(frame_observe::Sdk &sdk) {
         out << ",\"origin\":" << a_origin << "},\"axis0\":{\"error\":" << axis_error
             << ",\"active\":" << (axis_error == vr::VRInputError_None ? boolean(analog.bActive) : "null") << ",\"value\":";
         if (axis_active) { out << '['; number(out, analog.x); out << ','; number(out, analog.y); out << ']'; } else out << "null";
-        out << ",\"origin\":" << axis_origin << "},\"input_receipt\":\"unknown\",\"controller_forwarding\":\"unknown\"}";
+        out << ",\"origin\":" << axis_origin << '}';
+        if (trigger_diagnostic) {
+            out << ",\"right_trigger\":{\"error\":" << trigger_error << ",\"active\":"
+                << (trigger_error == vr::VRInputError_None ? boolean(trigger_data.bActive) : "null") << ",\"value\":";
+            if (trigger_active) number(out, trigger_data.x); else out << "null";
+            out << ",\"origin\":" << trigger_origin << '}';
+        }
+        out << ",\"input_receipt\":\"unknown\",\"controller_forwarding\":\"unknown\"}";
         emit(out.str()); // One complete unbuffered record, before shutdown or another SDK read.
         ++count;
         std::this_thread::sleep_until(std::min(tick + interval, end));
@@ -273,14 +288,19 @@ int main(int argc, char **argv) {
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGALRM, &action, nullptr) != 0) throw std::runtime_error("timeout_handler_unavailable");
         alarm(20);
-        if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--bindings"))
-            throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings]");
-        binding_diagnostics = argc == 3;
+        if (argc < 2 || argc > 4) throw std::runtime_error("usage: frame-controller-actions ABS_INPUT_ACTIONS_JSON [--bindings] [--trigger]");
+        for (int i = 2; i < argc; ++i) {
+            const std::string option(argv[i]);
+            if (option == "--bindings" && !binding_diagnostics) binding_diagnostics = true;
+            else if (option == "--trigger" && !trigger_diagnostic) trigger_diagnostic = true;
+            else throw std::runtime_error("invalid_or_duplicate_observer_option");
+        }
         const auto manifest = std::filesystem::path(argv[1]);
         validate_manifest(manifest); // Both reviewed files validated before SDK initialization.
         emit("{\"event\":\"start\",\"schema_version\":1,\"observer_pid\":" + std::to_string(getpid())
              + ",\"application_type\":\"background\",\"duration_seconds\":15,\"sample_limit\":300,\"maximum_hz\":20,\"binding_diagnostics\":"
-             + boolean(binding_diagnostics) + ",\"input_receipt\":\"unknown\"}");
+             + boolean(binding_diagnostics) + (trigger_diagnostic ? ",\"trigger_diagnostic\":true" : "")
+             + ",\"input_receipt\":\"unknown\"}");
         stage = "setup";
         unsigned count;
         {

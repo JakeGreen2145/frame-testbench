@@ -54,6 +54,12 @@ def action_fixture():
             return VRInputError_None;''',
         'GetAnalogActionData': '''if(unActionDataSize!=sizeof(*pActionData))abort();
             const auto &name=check_action(action,ulRestrictToDevice);
+            if(name=="/actions/observe/in/right_trigger_value") {
+                log("trigger_value");*pActionData={};pActionData->bActive=updates<30;pActionData->activeOrigin=1107;
+                pActionData->x=updates==12?std::numeric_limits<float>::quiet_NaN():updates>=4 && updates<=10?.60f:0;
+                if(updates==13)return VRInputError_WrongType;
+                return VRInputError_None;
+            }
             if(name!="/actions/observe/in/right_thumbstick_position")abort();
             *pActionData={};pActionData->bActive=updates<30;pActionData->activeOrigin=1107;
             pActionData->x=updates==12?std::numeric_limits<float>::quiet_NaN():.35f;pActionData->y=-.65f;
@@ -143,6 +149,30 @@ class ControllerActionTests(unittest.TestCase):
         self.assertFalse(any(line.startswith('set_') for line in calls))
         self.assertNotIn('binding_info_16', calls)
         self.assertNotIn('action_origins_64', calls)
+        self.assertNotIn('trigger_value', calls)
+        self.assertTrue(all('right_trigger' not in row for row in samples))
+        self.assertNotIn('trigger_diagnostic', records[0])
+
+    def test_trigger_opt_in_same_context_and_optional_binding_queries(self):
+        records = self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--trigger', '--bindings'])
+        self.assertTrue(records[0]['trigger_diagnostic'])
+        samples = [r for r in records if r['event'] == 'sample']
+        self.assertEqual(self.calls().count('trigger_value'), len(samples))
+        self.assertTrue(any(r['right_trigger']['active'] and abs(r['right_trigger']['value']-.60)<1e-6
+                            and r['right_trigger']['origin']['device_index']==7 for r in samples if r['right_trigger']['value'] is not None))
+        self.assertTrue(any(r['right_trigger']['active'] and r['right_trigger']['value'] is None for r in samples))
+        self.assertTrue(any(r['right_trigger']['error'] != 0 and r['right_trigger']['active'] is None and r['right_trigger']['value'] is None and r['right_trigger']['origin'] is None for r in samples))
+        self.assertTrue(any(r['right_trigger']['active'] is False and r['right_trigger']['value'] is None and r['right_trigger']['origin'] is None for r in samples))
+        self.assertTrue(all(r['input_receipt']=='unknown' for r in samples))
+        queries = [r for r in records if r['event']=='binding_query']
+        self.assertEqual(len(queries),9)
+        self.assertEqual({r['action'] for r in queries},{'right_a','axis0','right_trigger'})
+        self.assertEqual(self.calls().count('init_background'),1)
+        self.assertEqual(self.calls().count('manifest'),1)
+        self.assertEqual(self.calls().count('shutdown'),1)
+        self.assertEqual(self.calls().count('binding_info_16'),9)
+        self.assertEqual(self.calls().count('action_origins_64'),9)
+        self.assertFalse(any(line.startswith('set_') for line in self.calls()))
 
     def test_opt_in_binding_reads_are_bounded_in_same_client_and_errors_unknown(self):
         records = self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--bindings'])
@@ -208,6 +238,8 @@ class ControllerActionTests(unittest.TestCase):
         self.run_observer(args=[], code=1)
         self.run_observer(args=['relative/input-actions.json'], code=1)
         self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--duration', '1'], code=1)
+        self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--trigger', '--trigger'], code=1)
+        self.run_observer(args=[str(ROOT / 'resources/input-actions.json'), '--bindings', '--bindings'], code=1)
         self.assertEqual(self.calls(), [])
 
 

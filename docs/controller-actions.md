@@ -27,6 +27,19 @@ At sample sequences 0, 100 and 200, each action receives one `GetActionBindingIn
 
 Metadata events precede their associated sample. That sample's before/after context readings enclose the added queries; they do not prove uninterrupted context. No extra SDK process, producer input, focus request, priority change, binding display or manifest update occurs. Use the action state and producer correlation in the associated sample independently of mappings.
 
+## Optional trigger observation
+
+`--trigger` resolves the existing `/actions/observe/in/right_trigger_value` from the same pinned manifest and reads its analog data through the same right-hand source and SDK client. Resources and their byte pins remain unchanged. The scalar uses the SDK's X value. Default mode resolves no trigger handle, performs no trigger query and emits no trigger field.
+
+```sh
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --trigger > PRIVATE_FRESH_CAPTURE.jsonl
+./build/frame-controller-actions "$(pwd)/resources/input-actions.json" --trigger --bindings > PRIVATE_FRESH_BINDINGS.jsonl
+```
+
+Trigger mode adds `trigger_diagnostic=true` to the start record and `right_trigger` to each sample, with native error, active state, scalar value and exact origin information. Inactive/error/nonfinite values stay null. Existing before/after app, scene, dashboard and input availability context encloses this read. When `--bindings` is also selected, the same three sample-sequence snapshots include the trigger action with the existing 16-binding/64-origin capacities. Options may appear in either order; unknown or duplicate options fail before SDK initialization. No trigger components or bindings are created or changed.
+
+The trigger scalar's local action identity does not establish a Windows legacy axis index, its type or original game input. Those remain independent receiver observations. Existing mutation coordinators keep their unchanged default sampler. Any explicitly selected trigger coordinator must require a fully active exact-origin neutral trigger baseline and keep receipt unknown until a separately verified receiver observes the bounded scalar and its release. The observer produces no input.
+
 The known Testbench synthetic-right producer is independently identified by exact serial among at most64 controller-class devices each sample. Its current actual role and standing connected/valid pose are recorded. Missing or duplicate identities produce no selected producer. Each serial/app-key read uses one256-byte buffer without retries; malformed/error strings remain unknown. Serial identity is an experimental test correlation and does not identify a remote Windows receiver or game consumer.
 
 `IsInputAvailable` applies to this observer application's input context. It does not report raw component validity. A hand-restricted action can select a physical controller or change origins; the action origin must match the recorded synthetic producer in the same window. `input_receipt` and `controller_forwarding` always stay unknown. The helper emits observations, never a readiness marker, producer action, gameplay pass or physical gate.
