@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
-from . import controller_inputs, install, pose, recording, transport, session
+from . import controller_inputs, install, pose, recording, transport, session, record_session
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,6 +135,13 @@ def parser():
                         help='headset is continuous video, no audio; preview/stereo are sampled screenshots')
     record.add_argument('--output', help='fresh output directory on capture host')
     record.add_argument('--fetch', help='with --host, fetch video and timeline into a fresh local directory')
+    persistent = commands.add_parser('record-session', help='one bounded continuous recorder with generated segments; Linux only')
+    persistent.add_argument('--duration', type=int, default=330, help='whole runtime budget, 1..330 seconds, including precheck and shutdown')
+    persistent.add_argument('--segment-seconds', type=int, default=50, help='rotation target 1..50 seconds; at most seven files, each verified <=60 seconds')
+    persistent.add_argument('--fps', type=int, default=30)
+    persistent.add_argument('--output', required=True, help='fresh private output directory on capture host; generated segment names only')
+    verification = commands.add_parser('verify-record-session', help='CPU-only decode/PTS verification of an ended record session')
+    verification.add_argument('--output', required=True)
     for name in ('install', 'uninstall'):
         p = commands.add_parser(name, help='change only the SteamVR user service override')
         p.add_argument('--restart', action='store_true', help='restart SteamVR now; interrupts VR')
@@ -194,6 +201,10 @@ def dispatch(args, bench):
     if args.command == 'record':
         recording.validate(args.duration, args.fps, args.view)
         return bench.record(args.output, args.duration, args.fps, args.view)
+    if args.command == 'record-session':
+        return record_session.capture(args.output, args.duration, args.segment_seconds, args.fps)
+    if args.command == 'verify-record-session':
+        return record_session.verify(args.output)
     if args.command == 'capture':
         return bench.capture(args.output)
     if args.command in ('install', 'uninstall'):
@@ -215,6 +226,8 @@ def main(argv=None):
             recording.validate(args.duration, args.fps, args.view)
             if args.fetch and (Path(args.fetch).exists() or Path(args.fetch).is_symlink()):
                 raise FileExistsError('record fetch output already exists; use a fresh directory')
+        if args.command == 'record-session':
+            record_session.validate(args.duration, args.segment_seconds, args.fps)
         if args.host:
             # Remove only the transport options; preserve arguments and literal values.
             forwarded = []
@@ -229,7 +242,10 @@ def main(argv=None):
                     continue
                 forwarded.append(item)
                 i += 1
-            result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=300 if args.command == 'record' else 110)
+            timeout = (350 if args.command == 'record-session' else
+                       240 if args.command == 'verify-record-session' else
+                       300 if args.command == 'record' else 110)
+            result = transport.run_json(transport.remote_argv(args.host, args.remote_root, forwarded), timeout=timeout)
             if args.command == 'capture' and args.fetch:
                 result = fetch_capture(args.host, result, args.fetch)
             if args.command == 'record' and args.fetch:
@@ -237,9 +253,14 @@ def main(argv=None):
         else:
             if args.command in ('capture', 'record') and args.fetch:
                 raise ValueError('--fetch requires --host; use --output for local capture')
-            result = session.dispatch(args, Bench(args.socket), dispatch)
+            if args.command in ('record-session', 'verify-record-session'):
+                # This observer does not own overrides. In particular, an
+                # ambiguous client shutdown must never call Session.end().
+                result = dispatch(args, None)
+            else:
+                result = session.dispatch(args, Bench(args.socket), dispatch)
         print(json.dumps(result, indent=2, allow_nan=False))
-        return 0
+        return 1 if args.command in ('record-session', 'verify-record-session') and result.get('ok') is False else 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
         return 1
