@@ -76,9 +76,9 @@ def _run(argv, directory, stdout, stderr, timeout):
         _signal_group(process, signal.SIGKILL)
 
 
-def _verify(ffprobe, partial, duration, fps, timeout):
+def _verify(ffprobe, partial, duration, fps, timeout, *, diagnostics_directory=None):
     media_file(partial)
-    directory = partial.parent
+    directory = partial.parent if diagnostics_directory is None else diagnostics_directory
     probe_path, error_path = directory / 'ffprobe.json', directory / 'ffprobe.log'
     with probe_path.open('xb') as output, error_path.open('xb') as errors:
         _run([ffprobe, '-v', 'error', '-threads', '1', '-count_frames', '-show_packets',
