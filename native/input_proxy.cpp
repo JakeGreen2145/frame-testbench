@@ -8,6 +8,28 @@
 using namespace vr;
 extern "C" __attribute__((visibility("default"))) void *HmdDriverFactory(const char *, int *);
 namespace frame {
+template<class F> void observe(F &&function) noexcept { try { function(); } catch (...) {} }
+class ControllerProxy final : public ITrackedDeviceServerDriver {
+    ITrackedDeviceServerDriver *real_;
+    IVRProperties *properties_;
+    ControllerTrace &trace_;
+    uint64_t id_;
+public:
+    ControllerProxy(ITrackedDeviceServerDriver *real, IVRProperties *properties, ControllerTrace &trace, uint64_t id)
+        : real_(real), properties_(properties), trace_(trace), id_(id) {}
+    EVRInitError Activate(uint32_t index) override {
+        PropertyContainerHandle_t container=0;
+        observe([&] { if(properties_) container=properties_->TrackedDeviceToPropertyContainer(index); trace_.activating(id_,index,container); });
+        const auto result=real_->Activate(index);
+        observe([&] { trace_.activated(id_,result); trace_.refresh(properties_); });
+        return result;
+    }
+    void Deactivate() override { observe([&] { trace_.deactivated(id_); }); real_->Deactivate(); }
+    void EnterStandby() override { real_->EnterStandby(); }
+    void *GetComponent(const char *name) override { return real_->GetComponent(name); }
+    void DebugRequest(const char *request,char *response,uint32_t size) override { real_->DebugRequest(request,response,size); }
+    DriverPose_t GetPose() override { const auto pose=real_->GetPose(); observe([&] { trace_.get_pose(id_,pose); }); return pose; }
+};
 class Device final : public ITrackedDeviceServerDriver {
     ITrackedDeviceServerDriver *real_;
     IVRProperties *properties_;
@@ -35,19 +57,41 @@ class Host final : public IVRServerDriverHost {
     InputState &state_;
     std::mutex devices_mutex_;
     std::vector<std::unique_ptr<Device>> devices_;
+    std::vector<std::unique_ptr<ControllerProxy>> controllers_;
 public:
     IVRServerDriverHost *real = nullptr;
     IVRProperties *properties = nullptr;
     explicit Host(InputState &s) : state_(s) {}
-    void clear() { std::lock_guard<std::mutex> lock(devices_mutex_); devices_.clear(); }
+    void clear() { std::lock_guard<std::mutex> lock(devices_mutex_); devices_.clear(); controllers_.clear(); }
     bool TrackedDeviceAdded(const char *serial, ETrackedDeviceClass type, ITrackedDeviceServerDriver *driver) override {
+        if (type == TrackedDeviceClass_Controller && driver && state_.trace().enabled()) {
+            uint64_t id=0;
+            observe([&] { id=state_.trace().added(serial); });
+            if(id) {
+                ControllerProxy *pointer=nullptr;
+                observe([&] {
+                    auto wrapped=std::make_unique<ControllerProxy>(driver,properties,state_.trace(),id);
+                    auto *candidate=wrapped.get();
+                    std::lock_guard<std::mutex> lock(devices_mutex_); controllers_.push_back(std::move(wrapped));
+                    pointer=candidate;
+                });
+                if(pointer) {
+                    const bool accepted=real->TrackedDeviceAdded(serial,type,pointer);
+                    observe([&] { state_.trace().registered(id,accepted); });
+                    return accepted;
+                }
+            }
+            return real->TrackedDeviceAdded(serial,type,driver);
+        }
         if (type != TrackedDeviceClass_HMD || !driver) return real->TrackedDeviceAdded(serial, type, driver);
         auto wrapped = std::make_unique<Device>(driver, properties, state_);
         auto *pointer = wrapped.get();
         { std::lock_guard<std::mutex> lock(devices_mutex_); devices_.push_back(std::move(wrapped)); }
         return real->TrackedDeviceAdded(serial, type, pointer);
     }
-    void TrackedDevicePoseUpdated(uint32_t i, const DriverPose_t &p, uint32_t size) override { state_.physical_pose(i, p, size); }
+    void TrackedDevicePoseUpdated(uint32_t i, const DriverPose_t &p, uint32_t size) override {
+        observe([&] { state_.trace().publication(i,p,size); }); state_.physical_pose(i, p, size);
+    }
     void VsyncEvent(double t) override { real->VsyncEvent(t); }
     void VendorSpecificEvent(uint32_t i, EVREventType t, const VREvent_Data_t &d, double time) override { real->VendorSpecificEvent(i, t, d, time); }
     bool IsExiting() override { return real->IsExiting(); }
@@ -67,12 +111,20 @@ public:
     explicit Input(InputState &s) : state_(s) {}
     EVRInputError CreateBooleanComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h) override {
         const auto result = real->CreateBooleanComponent(c, n, h);
+        observe([&] { state_.trace().component(c,n,result==VRInputError_None && h ? *h : 0,true,0,0,result); });
         if (result == VRInputError_None && h && *h != k_ulInvalidInputComponentHandle) state_.component(c, n, *h);
         return result;
     }
-    EVRInputError UpdateBooleanComponent(VRInputComponentHandle_t h, bool value, double offset) override { return state_.physical_boolean(h, value, offset); }
-    EVRInputError CreateScalarComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h, EVRScalarType t, EVRScalarUnits u) override { return real->CreateScalarComponent(c, n, h, t, u); }
-    EVRInputError UpdateScalarComponent(VRInputComponentHandle_t h, float value, double offset) override { return real->UpdateScalarComponent(h, value, offset); }
+    EVRInputError UpdateBooleanComponent(VRInputComponentHandle_t h, bool value, double offset) override {
+        const auto result=state_.physical_boolean(h,value,offset); observe([&] { state_.trace().update(h,true,result); }); return result;
+    }
+    EVRInputError CreateScalarComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h, EVRScalarType t, EVRScalarUnits u) override {
+        const auto result=real->CreateScalarComponent(c,n,h,t,u);
+        observe([&] { state_.trace().component(c,n,result==VRInputError_None && h ? *h : 0,false,t,u,result); }); return result;
+    }
+    EVRInputError UpdateScalarComponent(VRInputComponentHandle_t h, float value, double offset) override {
+        const auto result=real->UpdateScalarComponent(h,value,offset); observe([&] { state_.trace().update(h,false,result); }); return result;
+    }
     EVRInputError CreateHapticComponent(PropertyContainerHandle_t c, const char *n, VRInputComponentHandle_t *h) override { return real->CreateHapticComponent(c, n, h); }
     EVRInputError CreateSkeletonComponent(PropertyContainerHandle_t c, const char *n, const char *p, const char *b, EVRSkeletalTrackingLevel l, const VRBoneTransform_t *g, uint32_t count, VRInputComponentHandle_t *h) override { return real->CreateSkeletonComponent(c, n, p, b, l, g, count, h); }
     EVRInputError UpdateSkeletonComponent(VRInputComponentHandle_t h, EVRSkeletalMotionRange r, const VRBoneTransform_t *p, uint32_t n) override { return real->UpdateSkeletonComponent(h, r, p, n); }
@@ -87,10 +139,15 @@ public:
     IVRDriverContext *real = nullptr;
     Host host;
     Input input;
-    explicit Context(InputState &s) : host(s), input(s) {}
+    InputState &state;
+    explicit Context(InputState &s) : host(s), input(s), state(s) {}
     void *GetGenericInterface(const char *name, EVRInitError *error = nullptr) override {
         void *result = real->GetGenericInterface(name, error);
         if (!result || !name) return result;
+        observe([&] {
+            const bool alias=(result==host.real || result==input.real) && strcmp(name,IVRServerDriverHost_Version) && strcmp(name,IVRDriverInput_Version);
+            state.trace().interface_request(name,alias);
+        });
         if (!strcmp(name, IVRServerDriverHost_Version) && result == host.real) return &host;
         if (!strcmp(name, IVRDriverInput_Version) && result == input.real) return &input;
         return result;
@@ -153,6 +210,7 @@ public:
         context_.input.real = static_cast<IVRDriverInput *>(context->GetGenericInterface(IVRDriverInput_Version));
         context_.host.properties = static_cast<IVRProperties *>(context->GetGenericInterface(IVRProperties_Version));
         state_.reset(context_.host.real, context_.input.real);
+        state_.trace_properties(context_.host.properties);
         auto result = real->Init(&context_);
         if (result != VRInitError_None) return result;
         if (!control_.start()) {
@@ -179,6 +237,7 @@ public:
         left_.input = right_.input = nullptr;
         real->Cleanup(); context_.host.clear();
         state_.reset(nullptr, nullptr);
+        state_.trace_properties(nullptr);
     }
     const char *const *GetInterfaceVersions() override { return real->GetInterfaceVersions(); }
     void RunFrame() override { real->RunFrame(); }

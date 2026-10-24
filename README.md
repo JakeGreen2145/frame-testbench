@@ -15,6 +15,8 @@ Input overrides stay active across CLI calls within a temporary session. Command
 
 The input adapter wraps the existing `cv` driver at public OpenVR interface boundaries. It forwards display components, unrelated devices, and unrelated inputs. It does not add a second HMD. This interception is experimental, not a Valve-supported extension mechanism.
 
+An optional [physical controller callback trace](docs/controller-trace.md) records whether real controller registration, pose and input callbacks enter the wrapped context. It is disabled by default and implements no physical-controller overrides.
+
 ## Build and install
 
 Requires Linux, Python 3, a C++17 compiler, and the existing SteamVR installation. Build natively on the Frame host to match its libc. Root access and changes to `/opt` are not needed.
@@ -108,6 +110,10 @@ The controllers expose the Frame profile's buttons, trigger/grip values, thumbst
 The optional stdio server exposes the same operations as typed MCP tools. It returns capture metadata and a PNG image block, so an agent can inspect the result without a separate file-reading tool. It opens no network listener. Host selection is fixed at startup, not controlled by tool arguments.
 
 See [MCP setup and tools](docs/mcp.md) for installation and client configuration. Installation/restarts remain explicit CLI operations rather than agent-exposed MCP tools.
+
+## Streamed Unity game tests
+
+The optional [streamed UGEVR session client](docs/streamed-sessions.md) launches through UGEVR's external Windows controller and keeps headset test leases and bounded captures in this repository. It reports host, peer, both-eye and input evidence separately. Pairing, stream controls and physical game association still need integration probes. Normal UGEVR use does not require Frame Testbench.
 
 ## Remote agent use
 

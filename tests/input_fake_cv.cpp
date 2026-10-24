@@ -1,11 +1,14 @@
 #include "openvr_driver.h"
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 using namespace vr;
 namespace {
 IVRDriverContext *ctx;
 IVRServerDriverHost *host;
 IVRDriverInput *input;
+IVRDriverInput *bypass_input;
 VRInputComponentHandle_t prox, prox2, other, button;
 unsigned lifecycle = 0;
 int component, factory_other;
@@ -14,6 +17,25 @@ class Device : public ITrackedDeviceServerDriver {
 public:
     explicit Device(bool h) : hmd(h) {}
     EVRInitError Activate(uint32_t index) override {
+        if (!hmd) {
+            assert(index == 9);
+            auto *used=input;
+            if(std::getenv("FAKE_TRACE_BYPASS")) {
+                used=static_cast<IVRDriverInput*>(ctx->GetGenericInterface("input-alias"));
+                assert(used==bypass_input);
+            }
+            assert(used);
+            VRInputComponentHandle_t boolean=0, scalar=0;
+            assert(used->CreateBooleanComponent(109,"/proximity",&boolean)==VRInputError_None);
+            assert(used->UpdateBooleanComponent(boolean,true,-0.125)==VRInputError_None);
+            assert(used->CreateScalarComponent(109,"scalar",&scalar,VRScalarType_Absolute,VRScalarUnits_NormalizedOneSided)==VRInputError_None);
+            assert(used->UpdateScalarComponent(scalar,0.5f,0.125)==VRInputError_InvalidParam);
+            if(std::getenv("FAKE_TRACE_OVERFLOW")) for(int k=0;k<80;++k) {
+                std::string path="/trace/component/"+std::to_string(k);
+                assert(used->CreateBooleanComponent(109,path.c_str(),&boolean)==VRInputError_None);
+            }
+            return std::getenv("FAKE_TRACE_ACTIVATE_ERROR") ? VRInitError_Driver_Failed : VRInitError_None;
+        }
         assert(index == 7);
         lifecycle |= 1;
         auto *props = static_cast<IVRProperties *>(ctx->GetGenericInterface(IVRProperties_Version));
@@ -77,6 +99,10 @@ public:
         input = static_cast<IVRDriverInput *>(ctx->GetGenericInterface(IVRDriverInput_Version));
         assert(host && input);
         assert(host->TrackedDeviceAdded("cv-real-hmd", TrackedDeviceClass_HMD, &hmd));
+        if(std::getenv("FAKE_TRACE_PENDING")) {
+            VRInputComponentHandle_t pending=0;
+            assert(input->CreateBooleanComponent(109,"/proximity",&pending)==VRInputError_None);
+        }
         assert(host->TrackedDeviceAdded("cv-controller", TrackedDeviceClass_Controller, &controller));
         assert(input->CreateBooleanComponent(109, "/proximity", &other) == VRInputError_None);
         return VRInitError_None;
@@ -111,6 +137,15 @@ extern "C" void FrameFakePhysical() {
     assert(input->UpdateBooleanComponent(button, false, -0.125) == VRInputError_None);
 }
 extern "C" void *FrameFakeController() { return &controller; }
+extern "C" void FrameFakeBypassInput(IVRDriverInput* original) { bypass_input=original; }
+extern "C" void FrameFakeFloodTrace() {
+    for(int k=0;k<100;++k) {
+        const std::string serial="cv-extra-"+std::to_string(k);
+        assert(host->TrackedDeviceAdded(serial.c_str(),TrackedDeviceClass_Controller,&controller));
+        VRInputComponentHandle_t handle=0;
+        assert(input->CreateBooleanComponent(1000+k,"/trace/component/0",&handle)==VRInputError_None);
+    }
+}
 extern "C" void *FrameFakeComponent() { return &component; }
 extern "C" void *FrameFakeOther() { return &factory_other; }
 extern "C" unsigned FrameFakeLifecycle() { return lifecycle; }
